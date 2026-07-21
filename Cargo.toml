@@ -1,0 +1,12 @@
+[package]
+name = "autochord"
+version = "0.1.0"
+edition = "2021"
+description = "Keyboard-driven synth controller in the terminal (Orchid-style)"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+cpal = "0.15"
+crossterm = "0.28"
+ratatui = "0.29"

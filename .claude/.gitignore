@@ -1,0 +1,3 @@
+# Per-machine state Claude Code writes inside .claude/ — not for git.
+# Skills, hooks, policies, and settings.json stay tracked.
+*.lock
