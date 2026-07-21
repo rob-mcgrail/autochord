@@ -97,10 +97,15 @@ global tempo (starts at 120 BPM), and it steps in 16th notes. Arp on/off and
 the pattern are part of the per-note lock, so one key can be a strummed chord
 and another an arpeggio — but tempo stays global.
 
-While the arp is running the clock free-runs, so changing chords (or re-hitting
-the current one to restart the pattern) swaps in on the **next step** without
-resetting the clock — it stays on the grid and the pulse never drifts, but
-without waiting a whole beat. The first chord from silence starts immediately.
+The arp runs off a shared wall-clock grid, so changing chords (or re-hitting
+the current one to restart the pattern) swaps in on the **next step** — it stays
+on the grid and the pulse never drifts.
+
+**Multiple instances stay in sync.** Tempo and the beat grid live in a small
+per-user file (`$TMPDIR/autochord-transport-$USER`); every autochord process on
+the machine derives its arp steps from that shared epoch and tempo, so two (or
+more) instances arpeggiate in exact lockstep. Change the tempo (↑/↓) in any one
+and the others follow within a moment.
 
 ### Transpose
 
@@ -110,6 +115,32 @@ physically **holding** re-pitches live as you transpose; a chord that's only
 **ringing** via latch stays put (and in a fallback terminal, where holds can't
 be detected, transpose only affects the next note you play). Shown as
 `transpose ±n` in the status line.
+
+## Synth (Tab)
+
+The voices are a small two-oscillator subtractive synth. **Tab** flips between
+the play view and a synth editor; the piano keys still play in both, so you hear
+edits live. In the editor, **arrow keys** move the cursor through the parameter
+grid and **`-` / `+`** change the selected value (hold to ramp).
+
+Signal path: `osc A + osc B + noise → resonant low-pass filter → amp`, in
+stereo (each oscillator can be panned).
+
+| Group | Parameters |
+|-------|------------|
+| Osc A / Osc B | wave (sine / tri / square), pitch offset, level, pan |
+| Noise | level |
+| Amp env | attack, decay, sustain, release |
+| Filter | cutoff, resonance, envelope amount |
+| Filter env | attack, decay, sustain, release (its own ADSR, sweeps the cutoff) |
+| Pitch LFO | rate, depth (vibrato) |
+| Filter LFO | rate, depth (cutoff wobble) |
+| Master | volume |
+
+Under the hood: PolyBLEP square to tame aliasing, a topology-preserving
+state-variable filter (per-voice, stereo) for the resonant low-pass, two
+free-running LFOs, and proper ADSR envelopes. The whole patch is a small `Copy`
+struct pushed to the audio thread on every edit.
 
 ## Sustain, latch, and key-release
 
@@ -142,9 +173,9 @@ How chords sustain depends on that:
 
 ```
 main.rs    terminal setup/teardown, keyboard-enhancement negotiation, event loop
-app.rs     UI state, key/latch/voice-steal logic; renders the chord name + piano
-audio.rs   cpal output stream; drains note events on the real-time thread
-synth.rs   pure DSP — polyphonic sine voices, click-free envelopes, VoiceMonitor
+app.rs     UI state, play/synth views, key routing, the synth-param editor
+audio.rs   cpal stereo output stream; drains note + patch events on the RT thread
+synth.rs   the synth engine — 2 osc + noise, resonant SVF, ADSRs, LFOs; VoiceMonitor
 notes.rs   key/chord mapping, qualities, additions, voicing, tuning, chord names
 ```
 

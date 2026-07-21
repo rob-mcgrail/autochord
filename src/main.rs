@@ -8,6 +8,7 @@ mod app;
 mod audio;
 mod notes;
 mod synth;
+mod transport;
 
 use std::io::{self, Stdout};
 use std::sync::mpsc;
@@ -30,6 +31,7 @@ use ratatui::Terminal;
 use app::App;
 use audio::SynthEvent;
 use synth::VoiceMonitor;
+use transport::Transport;
 
 /// UI refresh / input-poll interval (~60 Hz).
 const TICK: Duration = Duration::from_millis(16);
@@ -57,7 +59,7 @@ fn main() -> Result<()> {
     install_panic_hook(enhanced);
     let mut terminal = setup_terminal(enhanced)?;
 
-    let mut app = App::new(tx, audio_info, enhanced, just, monitor);
+    let mut app = App::new(tx, audio_info, enhanced, just, monitor, Transport::new());
     let result = run(&mut terminal, &mut app);
 
     restore_terminal(enhanced)?;

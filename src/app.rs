@@ -14,7 +14,8 @@ use crate::notes::{
     addition_for_key, chord_notes, chord_symbol, note_for_key, note_name, pitch_class_name,
     quality_for_key, tone_frequency, voice_chord, Addition, Quality, ADDITIONS, QUALITIES,
 };
-use crate::synth::VoiceMonitor;
+use crate::synth::{Patch, VoiceMonitor};
+use crate::transport::Transport;
 
 /// Clamp range for the Chord Voicing dial (clicks either side of neutral).
 const VOICING_RANGE: i32 = 24;
@@ -81,6 +82,190 @@ struct Held {
     notes: Vec<u8>,
 }
 
+/// Which screen is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    Play,
+    Synth,
+}
+
+/// An editable synth parameter. `usize` selects oscillator 0 or 1.
+#[derive(Clone, Copy)]
+enum Param {
+    OscWave(usize),
+    OscPitch(usize),
+    OscLevel(usize),
+    OscPan(usize),
+    Noise,
+    AmpA,
+    AmpD,
+    AmpS,
+    AmpR,
+    Cutoff,
+    Resonance,
+    FiltEnvAmt,
+    FiltA,
+    FiltD,
+    FiltS,
+    FiltR,
+    PitchLfoRate,
+    PitchLfoDepth,
+    FiltLfoRate,
+    FiltLfoDepth,
+    Master,
+}
+
+impl Param {
+    /// Nudge the parameter in `dir` (±1) within its range and step.
+    fn adjust(self, p: &mut Patch, dir: i32) {
+        let d = dir as f32;
+        let bump = |v: &mut f32, step: f32, lo: f32, hi: f32| *v = (*v + step * d).clamp(lo, hi);
+        match self {
+            Param::OscWave(i) => p.osc[i].wave = p.osc[i].wave.cycle(dir),
+            Param::OscPitch(i) => bump(&mut p.osc[i].pitch, 1.0, -24.0, 24.0),
+            Param::OscLevel(i) => bump(&mut p.osc[i].level, 0.05, 0.0, 1.0),
+            Param::OscPan(i) => bump(&mut p.osc[i].pan, 0.1, -1.0, 1.0),
+            Param::Noise => bump(&mut p.noise, 0.05, 0.0, 1.0),
+            Param::AmpA => bump(&mut p.amp.a, 0.01, 0.001, 4.0),
+            Param::AmpD => bump(&mut p.amp.d, 0.01, 0.001, 4.0),
+            Param::AmpS => bump(&mut p.amp.s, 0.05, 0.0, 1.0),
+            Param::AmpR => bump(&mut p.amp.r, 0.01, 0.001, 4.0),
+            Param::Cutoff => p.cutoff = (p.cutoff * 1.12f32.powi(dir)).clamp(20.0, 18000.0),
+            Param::Resonance => bump(&mut p.resonance, 0.05, 0.0, 1.0),
+            Param::FiltEnvAmt => bump(&mut p.filter_env_amount, 0.05, 0.0, 1.0),
+            Param::FiltA => bump(&mut p.filter_env.a, 0.01, 0.001, 4.0),
+            Param::FiltD => bump(&mut p.filter_env.d, 0.01, 0.001, 4.0),
+            Param::FiltS => bump(&mut p.filter_env.s, 0.05, 0.0, 1.0),
+            Param::FiltR => bump(&mut p.filter_env.r, 0.01, 0.001, 4.0),
+            Param::PitchLfoRate => bump(&mut p.pitch_lfo_rate, 0.25, 0.0, 20.0),
+            Param::PitchLfoDepth => bump(&mut p.pitch_lfo_depth, 0.1, 0.0, 12.0),
+            Param::FiltLfoRate => bump(&mut p.filter_lfo_rate, 0.25, 0.0, 20.0),
+            Param::FiltLfoDepth => bump(&mut p.filter_lfo_depth, 0.05, 0.0, 1.0),
+            Param::Master => bump(&mut p.master, 0.02, 0.0, 0.6),
+        }
+    }
+
+    /// The parameter's current value, formatted for display.
+    fn value(self, p: &Patch) -> String {
+        match self {
+            Param::OscWave(i) => p.osc[i].wave.label().to_string(),
+            Param::OscPitch(i) => format!("{:+}st", p.osc[i].pitch as i32),
+            Param::OscLevel(i) => pct(p.osc[i].level),
+            Param::OscPan(i) => pan_str(p.osc[i].pan),
+            Param::Noise => pct(p.noise),
+            Param::AmpA => secs(p.amp.a),
+            Param::AmpD => secs(p.amp.d),
+            Param::AmpS => pct(p.amp.s),
+            Param::AmpR => secs(p.amp.r),
+            Param::Cutoff => hz(p.cutoff),
+            Param::Resonance => pct(p.resonance),
+            Param::FiltEnvAmt => pct(p.filter_env_amount),
+            Param::FiltA => secs(p.filter_env.a),
+            Param::FiltD => secs(p.filter_env.d),
+            Param::FiltS => pct(p.filter_env.s),
+            Param::FiltR => secs(p.filter_env.r),
+            Param::PitchLfoRate => format!("{:.2}Hz", p.pitch_lfo_rate),
+            Param::PitchLfoDepth => format!("{:.1}st", p.pitch_lfo_depth),
+            Param::FiltLfoRate => format!("{:.2}Hz", p.filter_lfo_rate),
+            Param::FiltLfoDepth => pct(p.filter_lfo_depth),
+            Param::Master => pct(p.master / 0.6),
+        }
+    }
+}
+
+fn pct(v: f32) -> String {
+    format!("{}%", (v * 100.0).round() as i32)
+}
+
+fn secs(s: f32) -> String {
+    if s < 1.0 {
+        format!("{}ms", (s * 1000.0).round() as i32)
+    } else {
+        format!("{:.2}s", s)
+    }
+}
+
+fn hz(v: f32) -> String {
+    if v >= 1000.0 {
+        format!("{:.1}kHz", v / 1000.0)
+    } else {
+        format!("{}Hz", v.round() as i32)
+    }
+}
+
+fn pan_str(p: f32) -> String {
+    if p.abs() < 0.05 {
+        "C".to_string()
+    } else if p < 0.0 {
+        format!("L{}", (-p * 100.0).round() as i32)
+    } else {
+        format!("R{}", (p * 100.0).round() as i32)
+    }
+}
+
+/// One line in the synth editor: a section heading or a labelled parameter.
+enum Item {
+    Head(&'static str),
+    P(&'static str, Param),
+}
+
+/// The synth editor laid out in three columns.
+fn synth_columns() -> [Vec<Item>; 3] {
+    use Param::*;
+    [
+        vec![
+            Item::Head("OSC 1"),
+            Item::P("wave", OscWave(0)),
+            Item::P("pitch", OscPitch(0)),
+            Item::P("level", OscLevel(0)),
+            Item::P("pan", OscPan(0)),
+            Item::Head("OSC 2"),
+            Item::P("wave", OscWave(1)),
+            Item::P("pitch", OscPitch(1)),
+            Item::P("level", OscLevel(1)),
+            Item::P("pan", OscPan(1)),
+            Item::Head("NOISE"),
+            Item::P("level", Noise),
+        ],
+        vec![
+            Item::Head("AMP ENV"),
+            Item::P("attack", AmpA),
+            Item::P("decay", AmpD),
+            Item::P("sustain", AmpS),
+            Item::P("release", AmpR),
+            Item::Head("FILTER"),
+            Item::P("cutoff", Cutoff),
+            Item::P("reso", Resonance),
+            Item::P("env amt", FiltEnvAmt),
+            Item::Head("FILTER ENV"),
+            Item::P("attack", FiltA),
+            Item::P("decay", FiltD),
+            Item::P("sustain", FiltS),
+            Item::P("release", FiltR),
+        ],
+        vec![
+            Item::Head("PITCH LFO"),
+            Item::P("rate", PitchLfoRate),
+            Item::P("depth", PitchLfoDepth),
+            Item::Head("FILTER LFO"),
+            Item::P("rate", FiltLfoRate),
+            Item::P("depth", FiltLfoDepth),
+            Item::Head("MASTER"),
+            Item::P("volume", Master),
+        ],
+    ]
+}
+
+fn column_params(items: &[Item]) -> Vec<Param> {
+    items
+        .iter()
+        .filter_map(|it| match it {
+            Item::P(_, p) => Some(*p),
+            Item::Head(_) => None,
+        })
+        .collect()
+}
+
 /// A snapshot of the chord-shaping options. Used both for the persistent
 /// "working" brush and for the frozen configs locked to notes with backtick.
 #[derive(Clone, Default)]
@@ -132,18 +317,23 @@ pub struct App {
     arp_on: bool,
     /// Arpeggiator pattern (`1`/`2`) — locked per note.
     arp_pattern: ArpPattern,
-    /// Global tempo in BPM (↑/↓); not locked per note.
-    tempo: u32,
+    /// Shared clock: tempo + beat grid, synced across instances (↑/↓ set it).
+    transport: Transport,
     /// Arpeggiator runtime: pattern position, the note currently sounding, and
-    /// when the last step fired. `rng` seeds the Random pattern. The clock
-    /// (`last_step`) keeps running across chord changes so the pulse holds.
+    /// the last global grid step we fired on. `rng` seeds the Random pattern.
     arp_pos: usize,
     arp_sounding: Option<u8>,
-    last_step: Option<Instant>,
+    last_step: i64,
     rng: u32,
     /// MIDI notes we've sent NoteOn for and not yet NoteOff'd — lets us silence
     /// cleanly when switching chords or arp mode.
     sent: Vec<u8>,
+    /// The synth patch (edited in the Synth view, pushed to the audio thread).
+    patch: Patch,
+    /// Which screen is showing, and the synth-editor cursor `(column, row)`.
+    view: View,
+    synth_col: usize,
+    synth_row: usize,
     /// Key physically held right now (Kitty only); `None` when nothing is held
     /// or a chord is only ringing via latch.
     held: Option<char>,
@@ -161,7 +351,10 @@ impl App {
         enhanced: bool,
         just: bool,
         monitor: Arc<VoiceMonitor>,
+        transport: Transport,
     ) -> Self {
+        let patch = Patch::default();
+        let _ = tx.send(SynthEvent::SetPatch(patch)); // sync the audio thread
         Self {
             tx,
             audio,
@@ -179,12 +372,16 @@ impl App {
             window: 0,
             arp_on: false,
             arp_pattern: ArpPattern::Up,
-            tempo: 120,
+            transport,
             arp_pos: 0,
             arp_sounding: None,
-            last_step: None,
+            last_step: 0,
             rng: 0x9E3779B9,
             sent: Vec::new(),
+            patch,
+            view: View::Play,
+            synth_col: 0,
+            synth_row: 0,
             held: None,
             current: None,
             last_button: None,
@@ -194,7 +391,7 @@ impl App {
 
     /// Handle one key event from the terminal.
     pub fn on_key(&mut self, key: KeyEvent) {
-        // Quit: Esc or Ctrl-C only (q does not quit).
+        // Quit: Esc or Ctrl-C only (both views).
         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             let ctrl_c =
                 key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
@@ -202,21 +399,60 @@ impl App {
                 self.should_quit = true;
                 return;
             }
-            // Global tempo: up/down arrows (act on repeat too, for fast changes).
+        }
+
+        // Tab toggles the synth-editor view (both views).
+        if key.code == KeyCode::Tab {
+            if key.kind == KeyEventKind::Press {
+                self.view = match self.view {
+                    View::Play => View::Synth,
+                    View::Synth => View::Play,
+                };
+            }
+            return;
+        }
+
+        let c = char_of(key.code);
+
+        // Piano trigger keys work in BOTH views ("piano keys stay piano keys").
+        if let Some(ch) = c {
+            if let Some(root) = note_for_key(ch, self.window) {
+                match key.kind {
+                    KeyEventKind::Press => self.press(ch, root),
+                    KeyEventKind::Repeat => {}
+                    KeyEventKind::Release => self.release(ch),
+                }
+                return;
+            }
+        }
+
+        // Everything else is view-specific.
+        match self.view {
+            View::Play => self.play_key(key, c),
+            View::Synth => self.synth_key(key, c),
+        }
+    }
+
+    /// Play-view controls: tempo, latch, lock, dials, transpose, chords, arp.
+    fn play_key(&mut self, key: KeyEvent, c: Option<char>) {
+        // Global tempo: up/down arrows (shared across instances via transport).
+        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             match key.code {
                 KeyCode::Up => {
-                    self.tempo = (self.tempo + 5).min(TEMPO_MAX);
+                    let t = (self.transport.tempo() + 5).min(TEMPO_MAX);
+                    self.transport.set_tempo(t, ARP_SUBDIV);
                     return;
                 }
                 KeyCode::Down => {
-                    self.tempo = self.tempo.saturating_sub(5).max(TEMPO_MIN);
+                    let t = self.transport.tempo().saturating_sub(5).max(TEMPO_MIN);
+                    self.transport.set_tempo(t, ARP_SUBDIV);
                     return;
                 }
                 _ => {}
             }
         }
 
-        let Some(c) = char_of(key.code) else {
+        let Some(c) = c else {
             return;
         };
 
@@ -273,22 +509,50 @@ impl App {
 
         // Chord buttons: quality (7 8 9 0) and additions (u i o p). Toggle on
         // the press edge only, debounced so key-repeat can't flip them.
-        if quality_for_key(c).is_some() || addition_for_key(c).is_some() {
-            if key.kind == KeyEventKind::Press && self.button_debounced(c) {
-                self.toggle_button(c);
-            }
+        if (quality_for_key(c).is_some() || addition_for_key(c).is_some())
+            && key.kind == KeyEventKind::Press
+            && self.button_debounced(c)
+        {
+            self.toggle_button(c);
+        }
+    }
+
+    /// Synth-view controls: arrows navigate the parameter grid, `-`/`+` adjust.
+    fn synth_key(&mut self, key: KeyEvent, c: Option<char>) {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return;
         }
+        match key.code {
+            KeyCode::Up => return self.synth_nav(0, -1),
+            KeyCode::Down => return self.synth_nav(0, 1),
+            KeyCode::Left => return self.synth_nav(-1, 0),
+            KeyCode::Right => return self.synth_nav(1, 0),
+            _ => {}
+        }
+        match c {
+            Some('-') => self.synth_adjust(-1),
+            Some('+') | Some('=') => self.synth_adjust(1),
+            _ => {}
+        }
+    }
 
-        // Trigger keys. The note depends on where the window currently sits.
-        let Some(root) = note_for_key(c, self.window) else {
-            return;
-        };
+    /// Move the synth-editor cursor within the parameter grid.
+    fn synth_nav(&mut self, dcol: i32, drow: i32) {
+        let cols = synth_columns();
+        let col = (self.synth_col as i32 + dcol).clamp(0, cols.len() as i32 - 1) as usize;
+        let n = column_params(&cols[col]).len() as i32;
+        let row = (self.synth_row as i32 + drow).clamp(0, n.max(1) - 1) as usize;
+        self.synth_col = col;
+        self.synth_row = row;
+    }
 
-        match key.kind {
-            KeyEventKind::Press => self.press(c, root),
-            KeyEventKind::Repeat => {}
-            KeyEventKind::Release => self.release(c),
+    /// Adjust the selected parameter and push the new patch to the synth.
+    fn synth_adjust(&mut self, dir: i32) {
+        let cols = synth_columns();
+        let params = column_params(&cols[self.synth_col]);
+        if let Some(param) = params.get(self.synth_row.min(params.len().saturating_sub(1))) {
+            param.adjust(&mut self.patch, dir);
+            let _ = self.tx.send(SynthEvent::SetPatch(self.patch));
         }
     }
 
@@ -529,7 +793,9 @@ impl App {
         if self.arp_on {
             self.arp_pos = 0;
             self.arp_sounding = None;
-            self.last_step = None; // fire the first step on the next tick
+            // Catch up to the shared grid so the first note lands on the next
+            // step in lockstep with any other instances.
+            self.last_step = self.transport.step_position(ARP_SUBDIV).floor() as i64;
         } else {
             for &note in &notes {
                 self.send_on(root, note);
@@ -587,24 +853,20 @@ impl App {
         self.sync_working();
     }
 
-    /// Advance the arpeggiator clock; called every UI frame. The clock is
-    /// free-running while a chord arps, so chord changes and pattern restarts
-    /// land on the next step and never break the pulse.
+    /// Advance the arpeggiator against the shared transport grid; called every
+    /// UI frame. Steps are keyed to a machine-wide wall-clock grid, so every
+    /// instance fires on the same beats at the same tempo.
     pub fn tick(&mut self) {
+        self.transport.sync(); // pick up tempo/epoch changes from other instances
+        let step = self.transport.step_position(ARP_SUBDIV).floor() as i64;
         if !self.arp_on || self.current.is_none() {
-            self.last_step = None; // idle: clock stops
+            self.last_step = step; // stay caught up so the arp starts on the grid
             return;
         }
-        let interval = self.step_interval();
-        let now = Instant::now();
-        if self.last_step.is_none_or(|t| now.duration_since(t) >= interval) {
-            self.last_step = Some(now);
+        if step > self.last_step {
+            self.last_step = step; // fire once per grid step (no catch-up bursts)
             self.arp_step();
         }
-    }
-
-    fn step_interval(&self) -> Duration {
-        Duration::from_millis((60_000 / self.tempo.max(1) / ARP_SUBDIV) as u64)
     }
 
     /// Move the sounding arp note one step along the pattern.
@@ -675,17 +937,65 @@ pub fn render(app: &App, frame: &mut Frame) {
     let chunks = Layout::vertical([
         Constraint::Length(1), // status
         Constraint::Length(1), // padding
-        Constraint::Length(6), // control readout
-        Constraint::Min(0),    // breathing room
+        Constraint::Min(8),    // middle panel (controls or synth editor)
         Constraint::Length(1), // chord name
         Constraint::Length(3), // piano
     ])
     .split(frame.area());
 
     frame.render_widget(status(app), chunks[0]);
-    frame.render_widget(controls(app), chunks[2]);
-    frame.render_widget(chord_name(app), chunks[4]);
-    render_piano(app, frame, chunks[5]);
+    match app.view {
+        View::Play => frame.render_widget(controls(app), chunks[2]),
+        View::Synth => render_synth(app, frame, chunks[2]),
+    }
+    frame.render_widget(chord_name(app), chunks[3]);
+    render_piano(app, frame, chunks[4]);
+}
+
+/// The synth editor: three columns of parameters, arrow-navigated, `-`/`+` to
+/// adjust. The piano keys still play, so you hear edits live.
+fn render_synth(app: &App, frame: &mut Frame, area: Rect) {
+    let cols = synth_columns();
+    let areas = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(area);
+    for (ci, items) in cols.iter().enumerate() {
+        frame.render_widget(Paragraph::new(synth_column_lines(app, ci, items)), areas[ci]);
+    }
+}
+
+fn synth_column_lines(app: &App, ci: usize, items: &[Item]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut prow = 0usize; // running parameter index within this column
+    for it in items {
+        match it {
+            Item::Head(h) => lines.push(Line::from(Span::styled(
+                format!("  {h}"),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ))),
+            Item::P(label, param) => {
+                let selected = ci == app.synth_col && prow == app.synth_row;
+                let (marker, label_style, value_style) = if selected {
+                    (
+                        "▸",
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        Style::default().fg(ROOT_COLOR).add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    (
+                        " ",
+                        Style::default().fg(Color::Gray),
+                        Style::default().fg(Color::Cyan),
+                    )
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {marker} "), Style::default().fg(ROOT_COLOR)),
+                    Span::styled(format!("{label:<8}"), label_style),
+                    Span::styled(param.value(&app.patch), value_style),
+                ]));
+                prow += 1;
+            }
+        }
+    }
+    lines
 }
 
 /// The top control readout: chord types, additions, and the voicing/bass
@@ -757,7 +1067,7 @@ fn arp_line(app: &App) -> Line<'static> {
         spans.push(Span::styled(format!(" {} ", p.label()), style));
     }
     spans.push(Span::styled(
-        format!("   {} bpm", app.tempo),
+        format!("   {} bpm", app.transport.tempo()),
         Style::default().fg(if app.arp_on { Color::Gray } else { Color::DarkGray }),
     ));
     Line::from(spans)
@@ -860,12 +1170,16 @@ fn slider_track(pos: usize, width: usize) -> Vec<Span<'static>> {
 }
 
 fn status(app: &App) -> Paragraph<'static> {
+    let tab = match app.view {
+        View::Play => "tab:synth",
+        View::Synth => "SYNTH · tab:play",
+    };
     let release = if app.enhanced { "release on" } else { "release fallback" };
     let latch = if app.enhanced && !app.latch { "latch off" } else { "latch on" };
     let tuning = if app.just { "just" } else { "12-TET" };
     let z = note_for_key('z', app.window).map(note_name).unwrap_or_default();
     let text = format!(
-        "autochord   ·   {release}   ·   {latch} (q)   ·   {tuning}   ·   z:{z} < >   ·   {} {} Hz",
+        "autochord · {tab} · {release} · {latch} (q) · {tuning} · z:{z} < > · {} {}Hz",
         app.audio.device, app.audio.sample_rate
     );
     Paragraph::new(text)
@@ -1037,7 +1351,8 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let monitor = Arc::new(VoiceMonitor::new());
         let audio = AudioInfo { device: "test".into(), sample_rate: 48000 };
-        App::new(tx, audio, /*enhanced*/ true, /*just*/ true, monitor)
+        let transport = Transport::disconnected();
+        App::new(tx, audio, /*enhanced*/ true, /*just*/ true, monitor, transport)
     }
 
     fn tap(a: &mut App, c: char) {
@@ -1207,18 +1522,16 @@ mod tests {
         assert!(!a.arp_on);
     }
 
-    // an arp chord change swaps in place without resetting the clock, so the
-    // pulse holds; the new chord's pattern restarts from the bottom
+    // an arp chord change swaps in place and restarts the pattern from the
+    // bottom (the shared grid clock is untouched)
     #[test]
-    fn arp_chord_change_keeps_the_clock() {
+    fn arp_chord_change_swaps_in_place() {
         let mut a = app();
         tap(&mut a, '/'); // arp on
-        tap(&mut a, 'z'); // first chord (immediate), clock not yet started
-        a.tick(); // fire the first step -> clock running
-        assert!(a.last_step.is_some());
+        tap(&mut a, 'z'); // play C
+        a.arp_pos = 5; // pretend the pattern has advanced
         tap(&mut a, 'n'); // change chord while arping
         assert_eq!(root(&a), 69); // swapped in place (A)
-        assert!(a.last_step.is_some()); // clock preserved -> rhythm intact
         assert_eq!(a.arp_pos, 0); // pattern restarted for the new chord
     }
 
@@ -1228,11 +1541,9 @@ mod tests {
         let mut a = app();
         tap(&mut a, '/');
         tap(&mut a, 'z');
-        a.tick(); // step once -> arp_pos advances
-        assert_eq!(a.arp_pos, 1);
+        a.arp_pos = 5;
         tap(&mut a, 'z'); // re-click the same chord
         assert_eq!(a.arp_pos, 0); // restarted
-        assert!(a.last_step.is_some()); // still on the same clock
     }
 
     // arp on/off and pattern are captured by the per-note lock

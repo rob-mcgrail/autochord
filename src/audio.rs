@@ -8,7 +8,7 @@ use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 
-use crate::synth::{Synth, VoiceMonitor};
+use crate::synth::{Patch, Synth, VoiceMonitor};
 
 /// Commands sent from the UI thread to the real-time audio thread. A tone is
 /// identified by its MIDI note `id` (for on/off matching); `freq` carries the
@@ -16,6 +16,7 @@ use crate::synth::{Synth, VoiceMonitor};
 pub enum SynthEvent {
     NoteOn { id: u8, freq: f32 },
     NoteOff { id: u8 },
+    SetPatch(Patch),
 }
 
 /// Details about the running output stream, shown in the UI.
@@ -78,14 +79,19 @@ where
                 match event {
                     SynthEvent::NoteOn { id, freq } => synth.note_on(id, freq),
                     SynthEvent::NoteOff { id } => synth.note_off(id),
+                    SynthEvent::SetPatch(patch) => synth.set_patch(patch),
                 }
             }
 
-            // One mono sample fanned out across all channels.
+            // Stereo: L to even channels, R to odd (mono devices get L+R mix).
             for frame in output.chunks_mut(channels) {
-                let sample = T::from_sample(synth.next_sample());
-                for slot in frame.iter_mut() {
-                    *slot = sample;
+                let (l, r) = synth.next_frame();
+                if channels == 1 {
+                    frame[0] = T::from_sample((l + r) * 0.5);
+                } else {
+                    for (i, slot) in frame.iter_mut().enumerate() {
+                        *slot = T::from_sample(if i % 2 == 0 { l } else { r });
+                    }
                 }
             }
         },
