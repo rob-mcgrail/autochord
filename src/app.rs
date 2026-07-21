@@ -28,10 +28,14 @@ const WINDOW_RANGE: i32 = 14;
 /// key-repeat can't rapidly flip a latch on and off.
 const BUTTON_DEBOUNCE: Duration = Duration::from_millis(250);
 
-/// Tempo bounds (BPM) and the arpeggiator's steps-per-beat (16th notes).
+/// Tempo bounds (BPM) and the arpeggiator's steps-per-beat: 16ths straight,
+/// 16th-triplets in triplet mode.
 const TEMPO_MIN: u32 = 20;
 const TEMPO_MAX: u32 = 400;
 const ARP_SUBDIV: u32 = 4;
+const ARP_SUBDIV_TRIPLET: u32 = 6;
+/// Longest arp phrase multiplier (each note lasts N grid steps).
+const ARP_LENGTH_MAX: u32 = 16;
 
 /// Arpeggiator note order.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -94,6 +98,7 @@ enum View {
 enum Param {
     OscWave(usize),
     OscPitch(usize),
+    OscFine(usize),
     OscLevel(usize),
     OscPan(usize),
     Noise,
@@ -123,6 +128,7 @@ impl Param {
         match self {
             Param::OscWave(i) => p.osc[i].wave = p.osc[i].wave.cycle(dir),
             Param::OscPitch(i) => bump(&mut p.osc[i].pitch, 1.0, -24.0, 24.0),
+            Param::OscFine(i) => bump(&mut p.osc[i].fine, 1.0, -100.0, 100.0),
             Param::OscLevel(i) => bump(&mut p.osc[i].level, 0.05, 0.0, 1.0),
             Param::OscPan(i) => bump(&mut p.osc[i].pan, 0.1, -1.0, 1.0),
             Param::Noise => bump(&mut p.noise, 0.05, 0.0, 1.0),
@@ -137,9 +143,14 @@ impl Param {
             Param::FiltD => bump(&mut p.filter_env.d, 0.01, 0.001, 4.0),
             Param::FiltS => bump(&mut p.filter_env.s, 0.05, 0.0, 1.0),
             Param::FiltR => bump(&mut p.filter_env.r, 0.01, 0.001, 4.0),
-            Param::PitchLfoRate => bump(&mut p.pitch_lfo_rate, 0.25, 0.0, 20.0),
+            // Multiplicative so sub-1 Hz rates get very fine steps.
+            Param::PitchLfoRate => {
+                p.pitch_lfo_rate = (p.pitch_lfo_rate * 1.1f32.powi(dir)).clamp(0.02, 20.0)
+            }
             Param::PitchLfoDepth => bump(&mut p.pitch_lfo_depth, 0.1, 0.0, 12.0),
-            Param::FiltLfoRate => bump(&mut p.filter_lfo_rate, 0.25, 0.0, 20.0),
+            Param::FiltLfoRate => {
+                p.filter_lfo_rate = (p.filter_lfo_rate * 1.1f32.powi(dir)).clamp(0.02, 20.0)
+            }
             Param::FiltLfoDepth => bump(&mut p.filter_lfo_depth, 0.05, 0.0, 1.0),
             Param::Master => bump(&mut p.master, 0.02, 0.0, 0.6),
         }
@@ -150,6 +161,7 @@ impl Param {
         match self {
             Param::OscWave(i) => p.osc[i].wave.label().to_string(),
             Param::OscPitch(i) => format!("{:+}st", p.osc[i].pitch as i32),
+            Param::OscFine(i) => format!("{:+}c", p.osc[i].fine as i32),
             Param::OscLevel(i) => pct(p.osc[i].level),
             Param::OscPan(i) => pan_str(p.osc[i].pan),
             Param::Noise => pct(p.noise),
@@ -164,9 +176,9 @@ impl Param {
             Param::FiltD => secs(p.filter_env.d),
             Param::FiltS => pct(p.filter_env.s),
             Param::FiltR => secs(p.filter_env.r),
-            Param::PitchLfoRate => format!("{:.2}Hz", p.pitch_lfo_rate),
+            Param::PitchLfoRate => lfo_hz(p.pitch_lfo_rate),
             Param::PitchLfoDepth => format!("{:.1}st", p.pitch_lfo_depth),
-            Param::FiltLfoRate => format!("{:.2}Hz", p.filter_lfo_rate),
+            Param::FiltLfoRate => lfo_hz(p.filter_lfo_rate),
             Param::FiltLfoDepth => pct(p.filter_lfo_depth),
             Param::Master => pct(p.master / 0.6),
         }
@@ -190,6 +202,15 @@ fn hz(v: f32) -> String {
         format!("{:.1}kHz", v / 1000.0)
     } else {
         format!("{}Hz", v.round() as i32)
+    }
+}
+
+/// LFO rate — extra precision below 1 Hz so fine steps are visible.
+fn lfo_hz(v: f32) -> String {
+    if v < 1.0 {
+        format!("{:.3}Hz", v)
+    } else {
+        format!("{:.2}Hz", v)
     }
 }
 
@@ -217,11 +238,13 @@ fn synth_columns() -> [Vec<Item>; 3] {
             Item::Head("OSC 1"),
             Item::P("wave", OscWave(0)),
             Item::P("pitch", OscPitch(0)),
+            Item::P("fine", OscFine(0)),
             Item::P("level", OscLevel(0)),
             Item::P("pan", OscPan(0)),
             Item::Head("OSC 2"),
             Item::P("wave", OscWave(1)),
             Item::P("pitch", OscPitch(1)),
+            Item::P("fine", OscFine(1)),
             Item::P("level", OscLevel(1)),
             Item::P("pan", OscPan(1)),
             Item::Head("NOISE"),
@@ -268,7 +291,7 @@ fn column_params(items: &[Item]) -> Vec<Param> {
 
 /// A snapshot of the chord-shaping options. Used both for the persistent
 /// "working" brush and for the frozen configs locked to notes with backtick.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct ChordOptions {
     quality: Option<Quality>,
     additions: Vec<Addition>,
@@ -276,6 +299,23 @@ struct ChordOptions {
     bass: Option<i32>,
     arp_on: bool,
     arp_pattern: ArpPattern,
+    arp_length: u32,
+    arp_triplet: bool,
+}
+
+impl Default for ChordOptions {
+    fn default() -> Self {
+        Self {
+            quality: None,
+            additions: Vec::new(),
+            voicing: 0,
+            bass: None,
+            arp_on: false,
+            arp_pattern: ArpPattern::Up,
+            arp_length: 1,
+            arp_triplet: false,
+        }
+    }
 }
 
 pub struct App {
@@ -317,6 +357,10 @@ pub struct App {
     arp_on: bool,
     /// Arpeggiator pattern (`1`/`2`) — locked per note.
     arp_pattern: ArpPattern,
+    /// Arp phrase length: each note lasts this many grid steps (`3`/`4`).
+    arp_length: u32,
+    /// Triplet feel (`5`): 16th-triplet grid instead of straight 16ths.
+    arp_triplet: bool,
     /// Shared clock: tempo + beat grid, synced across instances (↑/↓ set it).
     transport: Transport,
     /// Arpeggiator runtime: pattern position, the note currently sounding, and
@@ -372,6 +416,8 @@ impl App {
             window: 0,
             arp_on: false,
             arp_pattern: ArpPattern::Up,
+            arp_length: 1,
+            arp_triplet: false,
             transport,
             arp_pos: 0,
             arp_sounding: None,
@@ -440,12 +486,12 @@ impl App {
             match key.code {
                 KeyCode::Up => {
                     let t = (self.transport.tempo() + 5).min(TEMPO_MAX);
-                    self.transport.set_tempo(t, ARP_SUBDIV);
+                    self.transport.set_tempo(t);
                     return;
                 }
                 KeyCode::Down => {
                     let t = self.transport.tempo().saturating_sub(5).max(TEMPO_MIN);
-                    self.transport.set_tempo(t, ARP_SUBDIV);
+                    self.transport.set_tempo(t);
                     return;
                 }
                 _ => {}
@@ -468,6 +514,22 @@ impl App {
         if matches!(c, '1' | '2') {
             if key.kind == KeyEventKind::Press && self.button_debounced(c) {
                 self.cycle_pattern(if c == '1' { -1 } else { 1 });
+            }
+            return;
+        }
+
+        // `3` / `4`: shrink / extend the arp phrase (note-length multiplier).
+        if matches!(c, '3' | '4') {
+            if key.kind == KeyEventKind::Press && self.button_debounced(c) {
+                self.adjust_arp_length(if c == '3' { -1 } else { 1 });
+            }
+            return;
+        }
+
+        // `5`: toggle triplet feel.
+        if c == '5' {
+            if key.kind == KeyEventKind::Press && self.button_debounced(c) {
+                self.toggle_triplet();
             }
             return;
         }
@@ -647,6 +709,8 @@ impl App {
         self.bass = cfg.bass;
         self.arp_on = cfg.arp_on;
         self.arp_pattern = cfg.arp_pattern;
+        self.arp_length = cfg.arp_length;
+        self.arp_triplet = cfg.arp_triplet;
     }
 
     /// Snapshot the live chord-shaping fields.
@@ -658,6 +722,8 @@ impl App {
             bass: self.bass,
             arp_on: self.arp_on,
             arp_pattern: self.arp_pattern,
+            arp_length: self.arp_length,
+            arp_triplet: self.arp_triplet,
         }
     }
 
@@ -795,7 +861,7 @@ impl App {
             self.arp_sounding = None;
             // Catch up to the shared grid so the first note lands on the next
             // step in lockstep with any other instances.
-            self.last_step = self.transport.step_position(ARP_SUBDIV).floor() as i64;
+            self.last_step = self.arp_note_step();
         } else {
             for &note in &notes {
                 self.send_on(root, note);
@@ -853,12 +919,43 @@ impl App {
         self.sync_working();
     }
 
+    /// Grid subdivisions per beat for the current feel.
+    fn arp_subdiv(&self) -> u32 {
+        if self.arp_triplet {
+            ARP_SUBDIV_TRIPLET
+        } else {
+            ARP_SUBDIV
+        }
+    }
+
+    /// The current arp note index on the shared grid (one note every
+    /// `arp_length` subdivisions), so a longer phrase = fewer notes per beat.
+    fn arp_note_step(&self) -> i64 {
+        let pos = self.transport.step_position(self.arp_subdiv());
+        (pos / self.arp_length.max(1) as f64).floor() as i64
+    }
+
+    /// Change the arp phrase length by `delta` note-steps; re-anchor the clock
+    /// so it doesn't fire a burst, and persist to the working brush.
+    fn adjust_arp_length(&mut self, delta: i32) {
+        self.arp_length = (self.arp_length as i32 + delta).clamp(1, ARP_LENGTH_MAX as i32) as u32;
+        self.last_step = self.arp_note_step();
+        self.sync_working();
+    }
+
+    /// Toggle triplet feel; re-anchor the clock and persist.
+    fn toggle_triplet(&mut self) {
+        self.arp_triplet = !self.arp_triplet;
+        self.last_step = self.arp_note_step();
+        self.sync_working();
+    }
+
     /// Advance the arpeggiator against the shared transport grid; called every
     /// UI frame. Steps are keyed to a machine-wide wall-clock grid, so every
     /// instance fires on the same beats at the same tempo.
     pub fn tick(&mut self) {
         self.transport.sync(); // pick up tempo/epoch changes from other instances
-        let step = self.transport.step_position(ARP_SUBDIV).floor() as i64;
+        let step = self.arp_note_step();
         if !self.arp_on || self.current.is_none() {
             self.last_step = step; // stay caught up so the arp starts on the grid
             return;
@@ -1032,7 +1129,38 @@ fn controls(app: &App) -> Paragraph<'static> {
             Some(o) => format!("root+{o}"),
         },
     );
-    Paragraph::new(vec![chord, adds, voicing, bass, arp_line(app), locked_row(app)])
+    Paragraph::new(vec![
+        chord,
+        adds,
+        voicing,
+        bass,
+        arp_line(app),
+        phrase_line(app),
+        locked_row(app),
+    ])
+}
+
+/// The arp phrase controls that sit under the arp row: length and triplet feel.
+fn phrase_line(app: &App) -> Line<'static> {
+    let mut spans = row_prefix("3 4", "phrase");
+    let on = app.arp_on;
+    let val = |lit: bool| {
+        if on && lit {
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+        } else if on {
+            Style::default().fg(Color::Gray)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
+    };
+    spans.push(Span::styled(format!("×{}", app.arp_length), val(app.arp_length > 1)));
+    spans.push(Span::styled("     5 ", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled("triplet ", Style::default().fg(Color::Yellow)));
+    spans.push(Span::styled(
+        if app.arp_triplet { "on" } else { "off" },
+        val(app.arp_triplet),
+    ));
+    Line::from(spans)
 }
 
 /// Grey key-hint + yellow label prefix shared by every control row, at a fixed
@@ -1544,6 +1672,43 @@ mod tests {
         a.arp_pos = 5;
         tap(&mut a, 'z'); // re-click the same chord
         assert_eq!(a.arp_pos, 0); // restarted
+    }
+
+    // 3/4 shrink/extend the phrase (clamped at 1), 5 toggles triplet
+    #[test]
+    fn arp_phrase_controls() {
+        let mut a = app();
+        assert_eq!(a.arp_length, 1);
+        a.adjust_arp_length(1);
+        assert_eq!(a.arp_length, 2);
+        a.adjust_arp_length(1);
+        assert_eq!(a.arp_length, 3);
+        a.adjust_arp_length(-1);
+        assert_eq!(a.arp_length, 2);
+        a.adjust_arp_length(-10);
+        assert_eq!(a.arp_length, 1); // clamped
+        assert!(!a.arp_triplet);
+        a.toggle_triplet();
+        assert!(a.arp_triplet);
+    }
+
+    // phrase length + triplet ride along with the per-note lock
+    #[test]
+    fn arp_phrase_locks_with_backtick() {
+        let mut a = app();
+        tap(&mut a, '/'); // arp on
+        a.adjust_arp_length(1); // len 2
+        a.toggle_triplet(); // triplet on
+        tap(&mut a, 'z'); // play C with len2/triplet
+        tap(&mut a, '`'); // lock C
+        a.adjust_arp_length(1); // brush -> len 3
+        a.toggle_triplet(); // brush -> straight
+        tap(&mut a, 'n'); // play A (brush)
+        assert_eq!(a.arp_length, 3);
+        assert!(!a.arp_triplet);
+        tap(&mut a, 'z'); // recall locked C
+        assert_eq!(a.arp_length, 2);
+        assert!(a.arp_triplet);
     }
 
     // arp on/off and pattern are captured by the per-note lock

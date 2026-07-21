@@ -92,10 +92,12 @@ the memories (highlighting the one backtick will unlock).
 
 `/` toggles the arpeggiator: instead of sounding a chord all at once, it plays
 the voiced notes one at a time in a pattern. `1` / `2` cycle the pattern
-(**up**, **down**, **up-down**, **random**); the **↑** / **↓** arrows set the
-global tempo (starts at 120 BPM), and it steps in 16th notes. Arp on/off and
-the pattern are part of the per-note lock, so one key can be a strummed chord
-and another an arpeggio — but tempo stays global.
+(**up**, **down**, **up-down**, **random**); **`3` / `4`** shrink / extend the
+phrase (each note lasts `×N` grid steps, so `4` from default makes it take twice
+as long); **`5`** toggles a **triplet** feel (16th-triplet grid). The **↑** /
+**↓** arrows set the global tempo (starts at 120 BPM). Arp on/off, pattern,
+phrase length and triplet are all part of the per-note lock, so one key can be a
+strummed chord and another a triplet arpeggio — but tempo stays global.
 
 The arp runs off a shared wall-clock grid, so changing chords (or re-hitting
 the current one to restart the pattern) swaps in on the **next step** — it stays
@@ -128,7 +130,7 @@ stereo (each oscillator can be panned).
 
 | Group | Parameters |
 |-------|------------|
-| Osc A / Osc B | wave (sine / tri / square), pitch offset, level, pan |
+| Osc A / Osc B | wave (sine / tri / square), pitch offset, fine detune (cents), level, pan |
 | Noise | level |
 | Amp env | attack, decay, sustain, release |
 | Filter | cutoff, resonance, envelope amount |

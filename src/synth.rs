@@ -109,6 +109,7 @@ fn poly_blep(t: f32, dt: f32) -> f32 {
 pub struct Osc {
     pub wave: Wave,
     pub pitch: f32, // semitone offset
+    pub fine: f32,  // fine detune in cents (±100 = ±1 semitone)
     pub level: f32, // 0..1
     pub pan: f32,   // -1 (L) .. +1 (R)
 }
@@ -143,8 +144,8 @@ impl Default for Patch {
     fn default() -> Self {
         Self {
             osc: [
-                Osc { wave: Wave::Triangle, pitch: 0.0, level: 0.6, pan: -0.25 },
-                Osc { wave: Wave::Sine, pitch: 0.0, level: 0.5, pan: 0.25 },
+                Osc { wave: Wave::Triangle, pitch: 0.0, fine: 0.0, level: 0.6, pan: -0.25 },
+                Osc { wave: Wave::Sine, pitch: 0.0, fine: 0.0, level: 0.5, pan: 0.25 },
             ],
             noise: 0.0,
             amp: Adsr { a: 0.01, d: 0.2, s: 0.8, r: 0.35 },
@@ -331,7 +332,8 @@ impl Voice {
 }
 
 fn run_osc(osc: &Osc, phase: &mut f32, pitch_lfo: f32, base_freq: f32, sr: f32) -> f32 {
-    let freq = base_freq * 2f32.powf((osc.pitch + pitch_lfo) / 12.0);
+    let semis = osc.pitch + osc.fine / 100.0 + pitch_lfo;
+    let freq = base_freq * 2f32.powf(semis / 12.0);
     let dt = freq / sr;
     let s = osc.wave.sample(*phase, dt) * osc.level;
     *phase = (*phase + dt).fract();

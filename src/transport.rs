@@ -62,11 +62,12 @@ impl Transport {
     }
 
     /// Set the tempo, re-anchoring the epoch so the current beat position is
-    /// preserved (no jump), and publish it for the other instances.
-    pub fn set_tempo(&mut self, tempo: u32, subdiv: u32) {
-        let pos = self.step_position(subdiv);
+    /// preserved (no jump), and publish it for the other instances. Preserving
+    /// beats keeps every subdivision continuous, whatever each instance uses.
+    pub fn set_tempo(&mut self, tempo: u32) {
+        let beats = self.step_position(1); // beats elapsed since the epoch
         self.tempo = tempo.max(1);
-        let back = (pos * 60_000.0 / (self.tempo as f64 * subdiv as f64)) as u64;
+        let back = (beats * 60_000.0 / self.tempo as f64) as u64;
         self.epoch_ms = now_ms().saturating_sub(back);
         if let Some(path) = &self.path {
             write(path, self.tempo, self.epoch_ms);
