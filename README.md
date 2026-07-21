@@ -137,10 +137,12 @@ the paths for you:
 ```sh
 autochord ls                              # list running instance PIDs
 autochord state [pid]                     # dump global + per-instance state
+autochord patches                         # list the built-in preset/config slots
 autochord send <pid> tempo 96             # change the (shared) tempo
 autochord send <pid> quality min          # switch chord quality
 autochord send <pid> arp on               # turn the arpeggiator on
 autochord send <pid> play C4              # play a chord on middle C
+autochord send <pid> patch Reese Bass     # load a preset (by name or index)
 autochord send <pid> subtractive.filter.cutoff 3000   # tweak the synth
 autochord install-skill                   # write the agent skill into ./.claude/skills
 ```
@@ -186,6 +188,20 @@ Under the hood: PolyBLEP square to tame aliasing, a topology-preserving
 state-variable filter (per-voice, stereo) for the resonant low-pass, two
 free-running LFOs, and proper ADSR envelopes. The whole patch is a small `Copy`
 struct pushed to the audio thread on every edit.
+
+### Presets & config slots
+
+There are **24 built-in patches** — pads, keys, plucks, basses, leads, arps and
+FX. **PgUp** / **PgDn** cycle through them (in either view); the current name
+shows in the status bar and atop the synth editor. Switching doesn't snap: the
+synth **glides** from the old patch to the new one over about a beat (tempo-tied,
+kept fast), so continuous parameters sweep smoothly.
+
+Think of the 24 as **mutable config slots** with hardcoded starting points. Edits
+are remembered **per slot, per instance** — tweak a patch, cycle away, come back,
+and your version is still there. The factory values only seed the slots at launch,
+so restarting the app resets them. Agents can jump straight to one with
+`autochord send <pid> patch <name-or-index>` (see the text interface above).
 
 ## Sustain, latch, and key-release
 

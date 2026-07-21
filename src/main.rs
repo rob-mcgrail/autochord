@@ -66,6 +66,12 @@ fn main() -> Result<()> {
             }
             return Ok(());
         }
+        Some("patches") => {
+            for (i, (name, _)) in synth::presets().iter().enumerate() {
+                println!("{i}\t{name}");
+            }
+            return Ok(());
+        }
         Some("install-skill") => {
             install_skill()?;
             return Ok(());
@@ -142,6 +148,7 @@ fn print_help() {
          autochord state [pid]     print live state (all instances, or one)\n\
          autochord send <pid> ...  send a `key value` command to an instance\n\
          autochord ls              list running instance PIDs\n\
+         autochord patches         list the built-in synth presets\n\
          autochord install-skill   write the agent skill into ./.claude/skills\n\
          \n\
          State/commands live as text files in {}",

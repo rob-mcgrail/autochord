@@ -531,8 +531,25 @@ pub struct App {
     /// MIDI notes we've sent NoteOn for and not yet NoteOff'd — lets us silence
     /// cleanly when switching chords or arp mode.
     sent: Vec<u8>,
-    /// The synth patch (edited in the Synth view, pushed to the audio thread).
+    /// The synth patch *target* — what the editor, presets, and text commands
+    /// set, and what `state_text` reports. The sounding patch (`patch_live`)
+    /// glides toward this over a beat, so switches don't jump.
     patch: Patch,
+    /// The currently-sounding patch, pushed to the audio thread. Interpolated
+    /// from `patch_from` toward `patch` while `patch_gliding`.
+    patch_live: Patch,
+    /// Snapshot of the sounding patch when the current glide began.
+    patch_from: Patch,
+    /// When the current patch glide started.
+    patch_glide_start: Instant,
+    /// True while `patch_live` is still catching up to `patch`.
+    patch_gliding: bool,
+    /// Currently-selected preset index (PgUp/PgDn cycle; `patch` key selects).
+    patch_index: usize,
+    /// This instance's editable copy of all presets. Seeded from the factory
+    /// bank at startup; edits are written back to the current slot, so
+    /// switching away and back recalls *your* modified version (per-pid).
+    patch_bank: [Patch; crate::synth::PRESET_COUNT],
     /// Text control interface for agents (state files + command inbox).
     control: Control,
     /// Which screen is showing, and the synth-editor cursor `(column, row)`.
@@ -561,7 +578,10 @@ impl App {
         monitor: Arc<VoiceMonitor>,
         transport: Transport,
     ) -> Self {
-        let patch = Patch::default();
+        // Seed this instance's mutable config slots from the factory presets.
+        let patch_bank: [Patch; crate::synth::PRESET_COUNT] =
+            crate::synth::presets().map(|(_, p)| p);
+        let patch = patch_bank[0]; // startup patch = first slot
         let _ = tx.send(SynthEvent::SetPatch(patch)); // sync the audio thread
         Self {
             tx,
@@ -589,6 +609,12 @@ impl App {
             rng: 0x9E3779B9,
             sent: Vec::new(),
             patch,
+            patch_live: patch,
+            patch_from: patch,
+            patch_glide_start: Instant::now(),
+            patch_gliding: false,
+            patch_index: 0,
+            patch_bank,
             control: Control::new(),
             view: View::Play,
             synth_col: 0,
@@ -620,6 +646,17 @@ impl App {
                     View::Play => View::Synth,
                     View::Synth => View::Play,
                 };
+            }
+            return;
+        }
+
+        // PgUp / PgDn cycle the preset bank (both views); wraps around.
+        if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+            if key.kind == KeyEventKind::Press {
+                let n = crate::synth::PRESET_COUNT;
+                // PgUp = previous, PgDn = next.
+                let step = if key.code == KeyCode::PageUp { n - 1 } else { 1 };
+                self.load_preset((self.patch_index + step) % n);
             }
             return;
         }
@@ -780,7 +817,46 @@ impl App {
         let params = column_params(&cols[self.synth_col]);
         if let Some(param) = params.get(self.synth_row.min(params.len().saturating_sub(1))) {
             param.adjust(&mut self.patch, dir);
-            let _ = self.tx.send(SynthEvent::SetPatch(self.patch));
+            self.retarget_patch();
+        }
+    }
+
+    /// Switch to config slot `index` (wrapping), gliding into it over a beat.
+    /// The current slot's edits are saved first, so returning to it later
+    /// recalls your modified version (slots are mutable and per-instance).
+    fn load_preset(&mut self, index: usize) {
+        self.patch_bank[self.patch_index] = self.patch; // remember current edits
+        self.patch_index = index % self.patch_bank.len();
+        self.patch = self.patch_bank[self.patch_index];
+        self.retarget_patch();
+    }
+
+    /// Begin (or restart) a glide of the sounding patch toward `self.patch`,
+    /// starting from wherever the sound currently is.
+    fn retarget_patch(&mut self) {
+        self.patch_from = self.patch_live;
+        self.patch_glide_start = Instant::now();
+        self.patch_gliding = true;
+    }
+
+    /// How long a patch glide takes: one beat, kept fast (0.12–0.6 s) so it's
+    /// gradual but never sluggish at slow tempos.
+    fn patch_glide_secs(&self) -> f32 {
+        (60.0 / self.transport.tempo() as f32).clamp(0.12, 0.6)
+    }
+
+    /// Advance the sounding patch toward the target; push it to the synth.
+    /// Called every frame from `tick`.
+    fn update_patch_glide(&mut self) {
+        if !self.patch_gliding {
+            return;
+        }
+        let dur = self.patch_glide_secs();
+        let t = (self.patch_glide_start.elapsed().as_secs_f32() / dur).min(1.0);
+        self.patch_live = Patch::lerp(&self.patch_from, &self.patch, t);
+        let _ = self.tx.send(SynthEvent::SetPatch(self.patch_live));
+        if t >= 1.0 {
+            self.patch_gliding = false;
         }
     }
 
@@ -1171,6 +1247,7 @@ impl App {
     /// instance fires on the same beats at the same tempo.
     pub fn tick(&mut self) {
         self.transport.sync(); // pick up tempo/epoch changes from other instances
+        self.update_patch_glide(); // ease the sounding patch toward its target
 
         // Fallback lead/bass: release the brief one-shot note when its gate lapses.
         if let Some(t) = self.lead_off {
@@ -1299,6 +1376,11 @@ impl App {
         });
         let notes: Vec<String> = self.active_notes().iter().map(|&n| note_name(n)).collect();
         let _ = writeln!(s, "notes {}", if notes.is_empty() { "-".into() } else { notes.join(" ") });
+        // Selected preset (PgUp/PgDn or the `patch` command).
+        let presets = crate::synth::presets();
+        let pi = self.patch_index.min(presets.len() - 1);
+        let _ = writeln!(s, "patch {pi}");
+        let _ = writeln!(s, "patch.name {}", presets[pi].0);
         // Synth-engine params, namespaced under the active engine's name.
         let _ = writeln!(s, "engine {SYNTH_ENGINE}");
         for p in all_params() {
@@ -1398,10 +1480,23 @@ impl App {
                 }
             }
             "stop" => self.stop_current(),
+            "patch" => {
+                // Select a preset by index (`patch 3`) or name (`patch Reese Bass`).
+                let presets = crate::synth::presets();
+                let index = if let Ok(i) = arg.parse::<usize>() {
+                    Some(i % presets.len())
+                } else {
+                    let name = rest.join(" ");
+                    presets.iter().position(|(n, _)| n.eq_ignore_ascii_case(&name))
+                };
+                if let Some(i) = index {
+                    self.load_preset(i);
+                }
+            }
             other => {
                 if let Some(p) = param_by_key(other) {
                     if p.set_raw(&mut self.patch, arg) {
-                        let _ = self.tx.send(SynthEvent::SetPatch(self.patch));
+                        self.retarget_patch();
                     }
                 }
             }
@@ -1508,11 +1603,34 @@ pub fn render(app: &App, frame: &mut Frame) {
 /// The synth editor: three columns of parameters, arrow-navigated, `-`/`+` to
 /// adjust. The piano keys still play, so you hear edits live.
 fn render_synth(app: &App, frame: &mut Frame, area: Rect) {
+    let rows = Layout::vertical([
+        Constraint::Length(1), // preset header
+        Constraint::Length(1), // padding
+        Constraint::Min(1),    // parameter columns
+    ])
+    .split(area);
+    frame.render_widget(patch_header(app), rows[0]);
     let cols = synth_columns();
-    let areas = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(area);
+    let areas = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(rows[2]);
     for (ci, items) in cols.iter().enumerate() {
         frame.render_widget(Paragraph::new(synth_column_lines(app, ci, items)), areas[ci]);
     }
+}
+
+/// The synth-view header: the selected preset and the keys that cycle it.
+fn patch_header(app: &App) -> Paragraph<'static> {
+    let presets = crate::synth::presets();
+    let i = app.patch_index.min(presets.len() - 1);
+    let hint = Style::default().fg(Color::DarkGray);
+    Paragraph::new(Line::from(vec![
+        Span::styled("  PgUp/PgDn ", hint),
+        Span::styled("patch ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            presets[i].0.to_string(),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  ({}/{})", i + 1, presets.len()), hint),
+    ]))
 }
 
 fn synth_column_lines(app: &App, ci: usize, items: &[Item]) -> Vec<Line<'static>> {
@@ -1768,8 +1886,10 @@ fn status(app: &App) -> Paragraph<'static> {
     let latch = if app.enhanced && !app.latch { "latch off" } else { "latch on" };
     let tuning = if app.just { "just" } else { "12-TET" };
     let z = note_for_key('z', app.window).map(note_name).unwrap_or_default();
+    let presets = crate::synth::presets();
+    let patch = presets[app.patch_index.min(presets.len() - 1)].0;
     let text = format!(
-        "autochord · {tab} · {release} · {latch} (q) · {tuning} · z:{z} < > · {} {}Hz",
+        "autochord · {tab} · {release} · {latch} (q) · {tuning} · z:{z} < > · patch:{patch} (PgUp/Dn) · {} {}Hz",
         app.audio.device, app.audio.sample_rate
     );
     Paragraph::new(text)
@@ -2280,5 +2400,34 @@ mod tests {
         assert!(s.contains("engine subtractive"));
         assert!(s.contains("subtractive.filter.cutoff 3000"));
         assert!(s.contains("subtractive.osc1.wave sqr"));
+
+        // Preset selection by index and by name.
+        a.apply_command("patch 3");
+        assert_eq!(a.patch_index, 3);
+        assert!((a.patch.cutoff - 500.0).abs() < 1.0); // factory slot 3 (Reese Bass)
+        a.apply_command("patch Warm Bloom");
+        assert_eq!(a.patch_index, 0);
+        assert!(a.state_text().contains("patch.name Warm Bloom"));
+        // Slot 0 was edited above (cutoff 3000), and slots remember edits.
+        assert!((a.patch.cutoff - 3000.0).abs() < 1.0);
+        // Out-of-range index wraps rather than panicking.
+        a.apply_command("patch 99");
+        assert_eq!(a.patch_index, 99 % crate::synth::PRESET_COUNT);
+    }
+
+    // Config slots are mutable per instance: edit one, leave, come back, and
+    // your edit is still there (factory values only seed them at startup).
+    #[test]
+    fn patch_slots_remember_edits() {
+        let mut a = app();
+        a.apply_command("patch 0");
+        a.apply_command("subtractive.filter.cutoff 4321");
+        assert!((a.patch.cutoff - 4321.0).abs() < 1.0);
+
+        a.apply_command("patch 5"); // switch away
+        assert_ne!(a.patch.cutoff, 4321.0); // slot 5's own value
+
+        a.apply_command("patch 0"); // return to our edited slot
+        assert!((a.patch.cutoff - 4321.0).abs() < 1.0); // edit survived
     }
 }

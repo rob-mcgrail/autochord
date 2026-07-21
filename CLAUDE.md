@@ -11,7 +11,8 @@ edit a full subtractive synth engine — all from the keyboard.
 - `src/app.rs` — all app state, key handling, the latch/lock model, arpeggiator,
   the synth editor, and the **text control interface** (`serve`, `state_text`,
   `apply_command`, and the `Param` key/raw/set_raw machinery).
-- `src/synth.rs` — the DSP: oscillators, filter, envelopes, LFOs, voices.
+- `src/synth.rs` — the DSP: oscillators, filter, envelopes, LFOs, voices; the
+  hardcoded `presets()` bank and `Patch::lerp` (for the beat-length patch glide).
 - `src/audio.rs` — cpal stream + the `SynthEvent` channel to the audio thread.
 - `src/control.rs` — the on-disk text interface (paths, inbox, publishing, CLI).
 - `src/transport.rs` — the shared musical clock (tempo + epoch) across instances.

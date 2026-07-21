@@ -28,7 +28,6 @@ directly.
 autochord ls              # list running instance PIDs
 autochord state           # global block + every instance's full state
 autochord state 12345     # just instance 12345
-autochord patches         # list the built-in preset/config slots (index + name)
 ```
 (Equivalent: `cat $TMPDIR/autochord-$USER/12345.state`.)
 
@@ -51,8 +50,6 @@ phrase 1
 triplet off
 chord Cmaj9
 notes C4 E4 G4 B4 D5
-patch 0
-patch.name Warm Bloom
 engine subtractive
 subtractive.osc1.wave tri
 subtractive.osc1.pitch 0
@@ -96,9 +93,6 @@ confirm the effect.
 - `arp on|off`, `pattern up|down|updown|random`, `phrase <mult>`
   (`0.125 0.25 0.5 1 2 3 4 …`), `triplet on|off`
 - `play <note>` (e.g. `play C4`, `play F#3`, `play 60`), `stop`
-- `patch <index-or-name>` — select a config slot by index (`patch 3`) or name
-  (`patch Reese Bass`, case-insensitive). `autochord patches` lists them. The
-  synth glides into the new patch over ~a beat rather than jumping.
 - any synth param by its `<engine>.`-prefixed key — for the subtractive engine:
   `subtractive.osc1.wave sine|tri|sqr`, `subtractive.osc1.pitch`,
   `subtractive.osc1.fine`, `subtractive.osc1.level`, `subtractive.osc1.pan`,
@@ -117,7 +111,3 @@ ranges.
 - A `.state` older than a few seconds means a dead instance (files are cleaned
   up on the next launch).
 - `tempo` is shared, so changing it in one instance changes it for all.
-- The 24 patches are **mutable config slots**, per instance (per pid): editing a
-  synth param changes the current slot, and switching away and back recalls your
-  modified version. The hardcoded preset values only seed the slots at startup;
-  they reset when the instance restarts.

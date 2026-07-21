@@ -144,6 +144,46 @@ pub struct Patch {
     pub master: f32,
 }
 
+impl Patch {
+    /// Linear blend of the continuous parameters from `a` to `b` at `t` in
+    /// `0..1` (t=0 → `a`, t=1 → `b` exactly). Oscillator waves are discrete, so
+    /// they snap to `b`. Used to glide between patches (preset switches, edits)
+    /// over a beat instead of jumping.
+    pub fn lerp(a: &Patch, b: &Patch, t: f32) -> Patch {
+        let t = t.clamp(0.0, 1.0);
+        let f = |x: f32, y: f32| x + (y - x) * t;
+        let osc = |i: usize| Osc {
+            wave: b.osc[i].wave,
+            pitch: f(a.osc[i].pitch, b.osc[i].pitch),
+            fine: f(a.osc[i].fine, b.osc[i].fine),
+            level: f(a.osc[i].level, b.osc[i].level),
+            pan: f(a.osc[i].pan, b.osc[i].pan),
+        };
+        let env = |x: &Adsr, y: &Adsr| Adsr {
+            a: f(x.a, y.a),
+            d: f(x.d, y.d),
+            s: f(x.s, y.s),
+            r: f(x.r, y.r),
+        };
+        Patch {
+            osc: [osc(0), osc(1)],
+            noise: f(a.noise, b.noise),
+            amp: env(&a.amp, &b.amp),
+            cutoff: f(a.cutoff, b.cutoff),
+            resonance: f(a.resonance, b.resonance),
+            filter_env: env(&a.filter_env, &b.filter_env),
+            filter_env_amount: f(a.filter_env_amount, b.filter_env_amount),
+            pitch_lfo_rate: f(a.pitch_lfo_rate, b.pitch_lfo_rate),
+            pitch_lfo_depth: f(a.pitch_lfo_depth, b.pitch_lfo_depth),
+            filter_lfo_rate: f(a.filter_lfo_rate, b.filter_lfo_rate),
+            filter_lfo_depth: f(a.filter_lfo_depth, b.filter_lfo_depth),
+            glide: f(a.glide, b.glide),
+            spread: f(a.spread, b.spread),
+            master: f(a.master, b.master),
+        }
+    }
+}
+
 impl Default for Patch {
     fn default() -> Self {
         Self {
@@ -166,6 +206,271 @@ impl Default for Patch {
             master: 0.16,
         }
     }
+}
+
+/// Number of built-in synth presets. PgUp/PgDn cycle them; the text interface
+/// selects one with the `patch` key.
+pub const PRESET_COUNT: usize = 24;
+
+/// The built-in preset bank, in cycle order. Index 0 is the startup patch.
+///
+/// Each patch is spelled out via struct-update over `Patch::default()`, so a
+/// line only names what it changes. Waves are limited to sine/tri/square, so
+/// character comes from detune, filter movement, envelope shape, and spread.
+pub fn presets() -> [(&'static str, Patch); PRESET_COUNT] {
+    fn osc(wave: Wave, pitch: f32, fine: f32, level: f32, pan: f32) -> Osc {
+        Osc { wave, pitch, fine, level, pan }
+    }
+    fn adsr(a: f32, d: f32, s: f32, r: f32) -> Adsr {
+        Adsr { a, d, s, r }
+    }
+    use Wave::{Sine, Square, Triangle};
+    let base = Patch::default();
+    [
+        // 0 — warm pad/pluck hybrid: detuned width, resonant bloom per note.
+        ("Warm Bloom", Patch {
+            osc: [osc(Square, 0.0, -6.0, 0.50, -0.35), osc(Triangle, 0.0, 6.0, 0.55, 0.35)],
+            noise: 0.03,
+            amp: adsr(0.012, 0.45, 0.55, 0.45),
+            cutoff: 900.0, resonance: 0.38, filter_env_amount: 0.65,
+            filter_env: adsr(0.008, 0.40, 0.22, 0.40),
+            filter_lfo_rate: 0.22, filter_lfo_depth: 0.18,
+            spread: 0.45, master: 0.17,
+            ..base
+        }),
+        // 1 — bright electric-piano: fast attack, decay to silence.
+        ("Glass Keys", Patch {
+            osc: [osc(Sine, 0.0, 0.0, 0.60, -0.15), osc(Triangle, 12.0, 0.0, 0.25, 0.15)],
+            amp: adsr(0.004, 1.2, 0.0, 0.4),
+            cutoff: 7000.0, resonance: 0.10, filter_env_amount: 0.20,
+            filter_env: adsr(0.005, 0.5, 0.0, 0.3),
+            spread: 0.2, master: 0.17,
+            ..base
+        }),
+        // 2 — clean sine sub with a touch of glide.
+        ("Deep Sub Bass", Patch {
+            osc: [osc(Sine, 0.0, 0.0, 0.90, 0.0), osc(Sine, -12.0, 0.0, 0.30, 0.0)],
+            amp: adsr(0.005, 0.2, 0.9, 0.15),
+            cutoff: 300.0, resonance: 0.10, filter_env_amount: 0.20,
+            filter_env: adsr(0.005, 0.15, 0.0, 0.15),
+            glide: 0.04, master: 0.22,
+            ..base
+        }),
+        // 3 — detuned squares, growly.
+        ("Reese Bass", Patch {
+            osc: [osc(Square, 0.0, -14.0, 0.50, 0.0), osc(Square, 0.0, 14.0, 0.50, 0.0)],
+            amp: adsr(0.005, 0.25, 0.85, 0.2),
+            cutoff: 500.0, resonance: 0.45, filter_env_amount: 0.30,
+            filter_env: adsr(0.005, 0.25, 0.2, 0.2),
+            glide: 0.03, master: 0.20,
+            ..base
+        }),
+        // 4 — slow-attack ensemble with vibrato and filter drift.
+        ("Analog Strings", Patch {
+            osc: [osc(Square, 0.0, -8.0, 0.45, -0.4), osc(Square, 0.0, 8.0, 0.45, 0.4)],
+            noise: 0.02,
+            amp: adsr(0.35, 0.5, 0.8, 0.9),
+            cutoff: 2200.0, resonance: 0.15, filter_env_amount: 0.20,
+            filter_env: adsr(0.4, 0.6, 0.6, 0.8),
+            pitch_lfo_rate: 4.5, pitch_lfo_depth: 0.06,
+            filter_lfo_rate: 0.3, filter_lfo_depth: 0.12,
+            spread: 0.5, master: 0.15,
+            ..base
+        }),
+        // 5 — hollow wide pad.
+        ("Hollow Pad", Patch {
+            osc: [osc(Square, 0.0, -12.0, 0.40, -0.5), osc(Triangle, 0.0, 12.0, 0.50, 0.5)],
+            amp: adsr(0.5, 0.6, 0.75, 1.0),
+            cutoff: 1600.0, resonance: 0.10, filter_env_amount: 0.15,
+            filter_env: adsr(0.6, 0.8, 0.5, 1.0),
+            filter_lfo_rate: 0.15, filter_lfo_depth: 0.2,
+            spread: 0.55, master: 0.15,
+            ..base
+        }),
+        // 6 — snappy resonant pluck, great for arps.
+        ("Pluck Stack", Patch {
+            osc: [osc(Square, 0.0, -4.0, 0.50, -0.25), osc(Triangle, 0.0, 4.0, 0.50, 0.25)],
+            amp: adsr(0.003, 0.25, 0.0, 0.25),
+            cutoff: 700.0, resonance: 0.50, filter_env_amount: 0.70,
+            filter_env: adsr(0.003, 0.22, 0.0, 0.2),
+            spread: 0.4, master: 0.18,
+            ..base
+        }),
+        // 7 — sine bell, long decay to silence.
+        ("Bell Sine", Patch {
+            osc: [osc(Sine, 0.0, 0.0, 0.60, -0.1), osc(Sine, 12.0, 2.0, 0.35, 0.1)],
+            amp: adsr(0.002, 1.5, 0.0, 1.2),
+            cutoff: 9000.0, resonance: 0.05, filter_env_amount: 0.0,
+            filter_env: adsr(0.01, 1.0, 0.0, 1.0),
+            spread: 0.25, master: 0.18,
+            ..base
+        }),
+        // 8 — mono square lead with glide.
+        ("Square Lead", Patch {
+            osc: [osc(Square, 0.0, 0.0, 0.70, 0.0), osc(Square, 0.0, -5.0, 0.35, 0.0)],
+            amp: adsr(0.006, 0.2, 0.8, 0.2),
+            cutoff: 2500.0, resonance: 0.30, filter_env_amount: 0.35,
+            filter_env: adsr(0.01, 0.2, 0.5, 0.2),
+            pitch_lfo_rate: 5.5, pitch_lfo_depth: 0.05,
+            glide: 0.06, spread: 0.1, master: 0.18,
+            ..base
+        }),
+        // 9 — breathy flute, slow attack, vibrato.
+        ("Soft Flute", Patch {
+            osc: [osc(Sine, 0.0, 0.0, 0.70, 0.0), osc(Triangle, 0.0, 4.0, 0.25, 0.0)],
+            noise: 0.06,
+            amp: adsr(0.12, 0.3, 0.85, 0.3),
+            cutoff: 3500.0, resonance: 0.10, filter_env_amount: 0.10,
+            filter_env: adsr(0.1, 0.3, 0.6, 0.3),
+            pitch_lfo_rate: 5.5, pitch_lfo_depth: 0.12,
+            spread: 0.15, master: 0.16,
+            ..base
+        }),
+        // 10 — expressive vibrato lead with glide.
+        ("Vibrato Lead", Patch {
+            osc: [osc(Triangle, 0.0, 0.0, 0.70, 0.0), osc(Sine, -12.0, 0.0, 0.30, 0.0)],
+            amp: adsr(0.02, 0.25, 0.85, 0.25),
+            cutoff: 3000.0, resonance: 0.20, filter_env_amount: 0.20,
+            filter_env: adsr(0.02, 0.25, 0.6, 0.25),
+            pitch_lfo_rate: 6.0, pitch_lfo_depth: 0.18,
+            glide: 0.08, spread: 0.1, master: 0.17,
+            ..base
+        }),
+        // 11 — heavily detuned warm pad.
+        ("Detuned Pad", Patch {
+            osc: [osc(Square, 0.0, -16.0, 0.45, -0.45), osc(Square, 0.0, 16.0, 0.45, 0.45)],
+            noise: 0.02,
+            amp: adsr(0.25, 0.5, 0.8, 0.8),
+            cutoff: 1800.0, resonance: 0.20, filter_env_amount: 0.30,
+            filter_env: adsr(0.3, 0.6, 0.5, 0.8),
+            filter_lfo_rate: 0.2, filter_lfo_depth: 0.15,
+            spread: 0.5, master: 0.15,
+            ..base
+        }),
+        // 12 — square sub-bass with a filter pluck.
+        ("Pulse Bass", Patch {
+            osc: [osc(Square, 0.0, 0.0, 0.70, 0.0), osc(Square, -12.0, 0.0, 0.40, 0.0)],
+            amp: adsr(0.004, 0.2, 0.7, 0.15),
+            cutoff: 450.0, resonance: 0.35, filter_env_amount: 0.55,
+            filter_env: adsr(0.004, 0.2, 0.0, 0.15),
+            glide: 0.02, master: 0.20,
+            ..base
+        }),
+        // 13 — slow low drone with deep filter sweep.
+        ("Dark Drone", Patch {
+            osc: [osc(Triangle, 0.0, -3.0, 0.50, -0.3), osc(Square, -12.0, 3.0, 0.40, 0.3)],
+            noise: 0.02,
+            amp: adsr(0.8, 1.0, 0.85, 1.5),
+            cutoff: 700.0, resonance: 0.25, filter_env_amount: 0.15,
+            filter_env: adsr(1.0, 1.5, 0.5, 1.5),
+            filter_lfo_rate: 0.08, filter_lfo_depth: 0.25,
+            spread: 0.4, master: 0.15,
+            ..base
+        }),
+        // 14 — bright wide chime, sparkles on arps.
+        ("Chime Arp", Patch {
+            osc: [osc(Triangle, 0.0, 0.0, 0.50, -0.2), osc(Sine, 12.0, 3.0, 0.40, 0.2)],
+            amp: adsr(0.002, 0.35, 0.1, 0.3),
+            cutoff: 6000.0, resonance: 0.20, filter_env_amount: 0.40,
+            filter_env: adsr(0.002, 0.3, 0.0, 0.25),
+            spread: 0.6, master: 0.17,
+            ..base
+        }),
+        // 15 — airy detuned choir, huge stereo.
+        ("Wide Choir", Patch {
+            osc: [osc(Sine, 0.0, -7.0, 0.50, -0.5), osc(Sine, 0.0, 7.0, 0.50, 0.5)],
+            noise: 0.04,
+            amp: adsr(0.3, 0.5, 0.85, 0.9),
+            cutoff: 3000.0, resonance: 0.08, filter_env_amount: 0.10,
+            filter_env: adsr(0.3, 0.5, 0.7, 0.8),
+            pitch_lfo_rate: 4.0, pitch_lfo_depth: 0.08,
+            filter_lfo_rate: 0.25, filter_lfo_depth: 0.1,
+            spread: 0.6, master: 0.15,
+            ..base
+        }),
+        // 16 — squelchy high-resonance 303-style.
+        ("Acid Zap", Patch {
+            osc: [osc(Square, 0.0, 0.0, 0.80, 0.0), osc(Square, 0.0, 0.0, 0.0, 0.0)],
+            amp: adsr(0.004, 0.2, 0.6, 0.12),
+            cutoff: 400.0, resonance: 0.70, filter_env_amount: 0.80,
+            filter_env: adsr(0.003, 0.18, 0.0, 0.12),
+            glide: 0.05, master: 0.18,
+            ..base
+        }),
+        // 17 — soft muted triangle pluck.
+        ("Muted Pluck", Patch {
+            osc: [osc(Triangle, 0.0, -3.0, 0.60, -0.2), osc(Triangle, 0.0, 3.0, 0.50, 0.2)],
+            amp: adsr(0.005, 0.3, 0.0, 0.25),
+            cutoff: 1200.0, resonance: 0.15, filter_env_amount: 0.30,
+            filter_env: adsr(0.005, 0.28, 0.0, 0.2),
+            spread: 0.35, master: 0.18,
+            ..base
+        }),
+        // 18 — punchy brass stab with a filter sweep.
+        ("Brass Stab", Patch {
+            osc: [osc(Square, 0.0, -5.0, 0.50, -0.2), osc(Square, 0.0, 5.0, 0.50, 0.2)],
+            noise: 0.02,
+            amp: adsr(0.03, 0.3, 0.75, 0.25),
+            cutoff: 1200.0, resonance: 0.30, filter_env_amount: 0.60,
+            filter_env: adsr(0.05, 0.3, 0.4, 0.25),
+            pitch_lfo_rate: 5.0, pitch_lfo_depth: 0.04,
+            spread: 0.3, master: 0.16,
+            ..base
+        }),
+        // 19 — dead-clean sine bass.
+        ("Sine Bass", Patch {
+            osc: [osc(Sine, 0.0, 0.0, 0.95, 0.0), osc(Sine, 0.0, 0.0, 0.0, 0.0)],
+            amp: adsr(0.004, 0.2, 0.9, 0.12),
+            cutoff: 800.0, resonance: 0.05, filter_env_amount: 0.15,
+            filter_env: adsr(0.004, 0.15, 0.0, 0.12),
+            glide: 0.03, master: 0.22,
+            ..base
+        }),
+        // 20 — lush pad with an octave-up layer.
+        ("Octave Pad", Patch {
+            osc: [osc(Square, 0.0, -5.0, 0.45, -0.35), osc(Triangle, 12.0, 5.0, 0.40, 0.35)],
+            noise: 0.02,
+            amp: adsr(0.2, 0.5, 0.8, 0.7),
+            cutoff: 2500.0, resonance: 0.15, filter_env_amount: 0.25,
+            filter_env: adsr(0.25, 0.5, 0.6, 0.7),
+            filter_lfo_rate: 0.2, filter_lfo_depth: 0.12,
+            spread: 0.5, master: 0.15,
+            ..base
+        }),
+        // 21 — bright octave shimmer, very wide.
+        ("Shimmer", Patch {
+            osc: [osc(Sine, 0.0, 0.0, 0.50, -0.3), osc(Triangle, 12.0, 4.0, 0.45, 0.3)],
+            noise: 0.02,
+            amp: adsr(0.15, 0.6, 0.7, 1.0),
+            cutoff: 7000.0, resonance: 0.10, filter_env_amount: 0.15,
+            filter_env: adsr(0.2, 0.6, 0.6, 1.0),
+            filter_lfo_rate: 0.18, filter_lfo_depth: 0.15,
+            spread: 0.65, master: 0.15,
+            ..base
+        }),
+        // 22 — moving growl bass (fast filter LFO).
+        ("Growl Bass", Patch {
+            osc: [osc(Square, 0.0, -10.0, 0.50, 0.0), osc(Square, 0.0, 10.0, 0.50, 0.0)],
+            amp: adsr(0.006, 0.25, 0.85, 0.2),
+            cutoff: 500.0, resonance: 0.40, filter_env_amount: 0.30,
+            filter_env: adsr(0.006, 0.25, 0.3, 0.2),
+            filter_lfo_rate: 3.5, filter_lfo_depth: 0.25,
+            glide: 0.03, master: 0.20,
+            ..base
+        }),
+        // 23 — huge slow ambient wash.
+        ("Ambient Wash", Patch {
+            osc: [osc(Sine, 0.0, -9.0, 0.45, -0.5), osc(Triangle, 0.0, 9.0, 0.45, 0.5)],
+            noise: 0.05,
+            amp: adsr(1.2, 1.5, 0.8, 2.0),
+            cutoff: 2000.0, resonance: 0.12, filter_env_amount: 0.20,
+            filter_env: adsr(1.5, 1.5, 0.6, 2.0),
+            pitch_lfo_rate: 3.0, pitch_lfo_depth: 0.05,
+            filter_lfo_rate: 0.06, filter_lfo_depth: 0.3,
+            spread: 0.7, master: 0.14,
+            ..base
+        }),
+    ]
 }
 
 // ===========================================================================
