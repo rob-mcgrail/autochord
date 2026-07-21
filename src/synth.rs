@@ -137,6 +137,10 @@ pub struct Patch {
     pub pitch_lfo_depth: f32,   // semitones
     pub filter_lfo_rate: f32,   // Hz
     pub filter_lfo_depth: f32,  // 0..1 (octaves of sweep)
+    pub glide: f32,             // portamento time in seconds (0 = off)
+    /// Stereo spread across a chord's notes (0..1). Applied by the app as a
+    /// per-note pan; the synth just honours the pan it's handed.
+    pub spread: f32,
     pub master: f32,
 }
 
@@ -157,6 +161,8 @@ impl Default for Patch {
             pitch_lfo_depth: 0.0,
             filter_lfo_rate: 2.0,
             filter_lfo_depth: 0.0,
+            glide: 0.0,
+            spread: 0.0,
             master: 0.16,
         }
     }
@@ -271,7 +277,9 @@ fn pan_gains(pan: f32) -> (f32, f32) {
 /// stereo pair of filters (so per-oscillator panning survives filtering).
 struct Voice {
     id: u8,
-    freq: f32,
+    freq: f32,  // target base frequency
+    glide: f32, // current base frequency (portamentos toward `freq`)
+    spread: f32, // stereo-spread pan offset (-1..1), from note position in the chord
     phase1: f32,
     phase2: f32,
     amp: Env,
@@ -285,6 +293,8 @@ impl Voice {
         Self {
             id,
             freq,
+            glide: freq,
+            spread: 0.0,
             phase1: 0.0,
             phase2: 0.0,
             amp: Env::new(),
@@ -309,11 +319,20 @@ impl Voice {
         let amp = self.amp.next(&p.amp, sr);
         let fenv = self.filt.next(&p.filter_env, sr);
 
+        // Portamento: glide the base frequency toward the target in pitch space.
+        if p.glide > 0.0 && (self.glide - self.freq).abs() > 0.01 {
+            let coeff = 1.0 - (-1.0 / (p.glide * sr)).exp();
+            self.glide *= (self.freq / self.glide).powf(coeff);
+        } else {
+            self.glide = self.freq;
+        }
+
         let plfo = pitch_lfo * p.pitch_lfo_depth; // semitones of vibrato
-        let o1 = run_osc(&p.osc[0], &mut self.phase1, plfo, self.freq, sr);
-        let o2 = run_osc(&p.osc[1], &mut self.phase2, plfo, self.freq, sr);
-        let (l1, r1) = pan_gains(p.osc[0].pan);
-        let (l2, r2) = pan_gains(p.osc[1].pan);
+        let o1 = run_osc(&p.osc[0], &mut self.phase1, plfo, self.glide, sr);
+        let o2 = run_osc(&p.osc[1], &mut self.phase2, plfo, self.glide, sr);
+        // Stereo-spread the whole voice on top of each oscillator's own pan.
+        let (l1, r1) = pan_gains((p.osc[0].pan + self.spread).clamp(-1.0, 1.0));
+        let (l2, r2) = pan_gains((p.osc[1].pan + self.spread).clamp(-1.0, 1.0));
         let n = noise * p.noise * FRAC_1_SQRT_2;
         let mut l = o1 * l1 + o2 * l2 + n;
         let mut r = o1 * r1 + o2 * r2 + n;
@@ -357,6 +376,7 @@ pub struct Synth {
     patch: Patch,
     pitch_lfo_phase: f32,
     filter_lfo_phase: f32,
+    last_freq: f32, // most recent note pitch — the glide origin for portamento
     rng: u32,
     monitor: Arc<VoiceMonitor>,
 }
@@ -369,6 +389,7 @@ impl Synth {
             patch: Patch::default(),
             pitch_lfo_phase: 0.0,
             filter_lfo_phase: 0.0,
+            last_freq: 220.0,
             rng: 0x1234_5678,
             monitor,
         }
@@ -378,15 +399,21 @@ impl Synth {
         self.patch = patch;
     }
 
-    /// Start (or retrigger) a tone with the given id at `freq`.
-    pub fn note_on(&mut self, id: u8, freq: f32) {
+    /// Start (or retrigger) a tone with the given id at `freq`, panned by `pan`
+    /// (stereo spread from its position in the chord).
+    pub fn note_on(&mut self, id: u8, freq: f32, pan: f32) {
         if let Some(voice) = self.voices.iter_mut().find(|v| v.id == id) {
-            voice.gate_on(freq);
+            voice.spread = pan;
+            voice.gate_on(freq); // glide continues from the voice's current pitch
         } else {
             let mut voice = Voice::new(id, freq);
+            voice.spread = pan;
+            // With portamento on, glide in from the previous note's pitch.
+            voice.glide = if self.patch.glide > 0.0 { self.last_freq } else { freq };
             voice.gate_on(freq);
             self.voices.push(voice);
         }
+        self.last_freq = freq;
         self.monitor.set(id, true);
     }
 
@@ -449,17 +476,20 @@ mod tests {
         let mut p = Patch::default();
         p.osc[0].wave = Wave::Square;
         p.osc[1].wave = Wave::Triangle;
+        p.osc[1].fine = 7.0;
         p.noise = 0.4;
         p.resonance = 0.95;
         p.filter_env_amount = 1.0;
         p.pitch_lfo_depth = 2.0;
         p.filter_lfo_depth = 1.0;
+        p.glide = 0.2;
+        p.spread = 0.8;
         s.set_patch(p);
 
-        s.note_on(60, 261.63);
-        s.note_on(64, 329.63);
-        s.note_on(67, 392.0);
-        run(&mut s, 48_000); // ~1s: attack/decay/sustain
+        s.note_on(60, 261.63, -0.8);
+        s.note_on(64, 329.63, 0.0);
+        s.note_on(67, 392.0, 0.8);
+        run(&mut s, 48_000); // ~1s: attack/decay/sustain + glide
         s.note_off(60);
         s.note_off(64);
         s.note_off(67);

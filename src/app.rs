@@ -14,7 +14,9 @@ use crate::notes::{
     addition_for_key, chord_notes, chord_symbol, note_for_key, note_name, pitch_class_name,
     quality_for_key, tone_frequency, voice_chord, Addition, Quality, ADDITIONS, QUALITIES,
 };
-use crate::synth::{Patch, VoiceMonitor};
+use crate::control::Control;
+use crate::notes::parse_note;
+use crate::synth::{Patch, VoiceMonitor, Wave};
 use crate::transport::Transport;
 
 /// Clamp range for the Chord Voicing dial (clicks either side of neutral).
@@ -28,14 +30,30 @@ const WINDOW_RANGE: i32 = 14;
 /// key-repeat can't rapidly flip a latch on and off.
 const BUTTON_DEBOUNCE: Duration = Duration::from_millis(250);
 
+/// In the release-fallback, a single note (no chord selected) plays as a brief
+/// one-shot of this length rather than latching — good for basslines/leads.
+const LEAD_GATE: Duration = Duration::from_millis(160);
+
+/// The active synth engine's name. Its parameters are exposed to the text
+/// control interface namespaced under this (`subtractive.filter.cutoff`, …).
+/// The subtractive engine is the first of what may be several; a future engine
+/// gets its own name here and its params fall under that prefix, with the
+/// `engine` state key naming whichever is live.
+const SYNTH_ENGINE: &str = "subtractive";
+
 /// Tempo bounds (BPM) and the arpeggiator's steps-per-beat: 16ths straight,
 /// 16th-triplets in triplet mode.
 const TEMPO_MIN: u32 = 20;
 const TEMPO_MAX: u32 = 400;
 const ARP_SUBDIV: u32 = 4;
 const ARP_SUBDIV_TRIPLET: u32 = 6;
-/// Longest arp phrase multiplier (each note lasts N grid steps).
-const ARP_LENGTH_MAX: u32 = 16;
+/// Arp phrase multipliers: each note's length as a factor of the base 16th.
+/// Below 1 goes faster (32nd/64th/128th), above goes slower (8th, quarter, …).
+const ARP_LENGTHS: [f32; 11] = [
+    0.125, 0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+];
+/// Index of the ×1 default in `ARP_LENGTHS`.
+const ARP_LEN_DEFAULT: usize = 3;
 
 /// Arpeggiator note order.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -117,6 +135,8 @@ enum Param {
     PitchLfoDepth,
     FiltLfoRate,
     FiltLfoDepth,
+    Glide,
+    Spread,
     Master,
 }
 
@@ -152,6 +172,8 @@ impl Param {
                 p.filter_lfo_rate = (p.filter_lfo_rate * 1.1f32.powi(dir)).clamp(0.02, 20.0)
             }
             Param::FiltLfoDepth => bump(&mut p.filter_lfo_depth, 0.05, 0.0, 1.0),
+            Param::Glide => bump(&mut p.glide, 0.01, 0.0, 1.0),
+            Param::Spread => bump(&mut p.spread, 0.05, 0.0, 1.0),
             Param::Master => bump(&mut p.master, 0.02, 0.0, 0.6),
         }
     }
@@ -180,9 +202,144 @@ impl Param {
             Param::PitchLfoDepth => format!("{:.1}st", p.pitch_lfo_depth),
             Param::FiltLfoRate => lfo_hz(p.filter_lfo_rate),
             Param::FiltLfoDepth => pct(p.filter_lfo_depth),
+            Param::Glide => {
+                if p.glide < 0.005 {
+                    "off".to_string()
+                } else {
+                    secs(p.glide)
+                }
+            }
+            Param::Spread => {
+                if p.spread <= 0.0 {
+                    "off".to_string()
+                } else {
+                    pct(p.spread)
+                }
+            }
             Param::Master => pct(p.master / 0.6),
         }
     }
+
+    /// Stable key used in the text control interface (state + commands),
+    /// namespaced under the active synth engine.
+    fn key(self) -> String {
+        format!("{SYNTH_ENGINE}.{}", self.field())
+    }
+
+    /// The engine-local field name (unprefixed).
+    fn field(self) -> String {
+        match self {
+            Param::OscWave(i) => format!("osc{}.wave", i + 1),
+            Param::OscPitch(i) => format!("osc{}.pitch", i + 1),
+            Param::OscFine(i) => format!("osc{}.fine", i + 1),
+            Param::OscLevel(i) => format!("osc{}.level", i + 1),
+            Param::OscPan(i) => format!("osc{}.pan", i + 1),
+            Param::Noise => "noise".into(),
+            Param::AmpA => "amp.attack".into(),
+            Param::AmpD => "amp.decay".into(),
+            Param::AmpS => "amp.sustain".into(),
+            Param::AmpR => "amp.release".into(),
+            Param::Cutoff => "filter.cutoff".into(),
+            Param::Resonance => "filter.reso".into(),
+            Param::FiltEnvAmt => "filter.env".into(),
+            Param::FiltA => "filterenv.attack".into(),
+            Param::FiltD => "filterenv.decay".into(),
+            Param::FiltS => "filterenv.sustain".into(),
+            Param::FiltR => "filterenv.release".into(),
+            Param::PitchLfoRate => "pitchlfo.rate".into(),
+            Param::PitchLfoDepth => "pitchlfo.depth".into(),
+            Param::FiltLfoRate => "filterlfo.rate".into(),
+            Param::FiltLfoDepth => "filterlfo.depth".into(),
+            Param::Glide => "glide".into(),
+            Param::Spread => "spread".into(),
+            Param::Master => "master".into(),
+        }
+    }
+
+    /// Raw (machine-parseable) value for the control interface.
+    fn raw(self, p: &Patch) -> String {
+        match self {
+            Param::OscWave(i) => p.osc[i].wave.label().to_string(),
+            Param::OscPitch(i) => format!("{}", p.osc[i].pitch as i32),
+            Param::OscFine(i) => format!("{}", p.osc[i].fine as i32),
+            Param::OscLevel(i) => format!("{:.2}", p.osc[i].level),
+            Param::OscPan(i) => format!("{:.2}", p.osc[i].pan),
+            Param::Noise => format!("{:.2}", p.noise),
+            Param::AmpA => format!("{:.3}", p.amp.a),
+            Param::AmpD => format!("{:.3}", p.amp.d),
+            Param::AmpS => format!("{:.2}", p.amp.s),
+            Param::AmpR => format!("{:.3}", p.amp.r),
+            Param::Cutoff => format!("{:.0}", p.cutoff),
+            Param::Resonance => format!("{:.2}", p.resonance),
+            Param::FiltEnvAmt => format!("{:.2}", p.filter_env_amount),
+            Param::FiltA => format!("{:.3}", p.filter_env.a),
+            Param::FiltD => format!("{:.3}", p.filter_env.d),
+            Param::FiltS => format!("{:.2}", p.filter_env.s),
+            Param::FiltR => format!("{:.3}", p.filter_env.r),
+            Param::PitchLfoRate => format!("{:.3}", p.pitch_lfo_rate),
+            Param::PitchLfoDepth => format!("{:.2}", p.pitch_lfo_depth),
+            Param::FiltLfoRate => format!("{:.3}", p.filter_lfo_rate),
+            Param::FiltLfoDepth => format!("{:.2}", p.filter_lfo_depth),
+            Param::Glide => format!("{:.3}", p.glide),
+            Param::Spread => format!("{:.2}", p.spread),
+            Param::Master => format!("{:.2}", p.master),
+        }
+    }
+
+    /// Set from a raw string (control interface); returns false if unparseable.
+    fn set_raw(self, p: &mut Patch, v: &str) -> bool {
+        if let Param::OscWave(i) = self {
+            p.osc[i].wave = match v {
+                "sine" => Wave::Sine,
+                "tri" | "triangle" => Wave::Triangle,
+                "sqr" | "square" => Wave::Square,
+                _ => return false,
+            };
+            return true;
+        }
+        let Ok(x) = v.parse::<f32>() else {
+            return false;
+        };
+        match self {
+            Param::OscWave(_) => {}
+            Param::OscPitch(i) => p.osc[i].pitch = x.clamp(-24.0, 24.0),
+            Param::OscFine(i) => p.osc[i].fine = x.clamp(-100.0, 100.0),
+            Param::OscLevel(i) => p.osc[i].level = x.clamp(0.0, 1.0),
+            Param::OscPan(i) => p.osc[i].pan = x.clamp(-1.0, 1.0),
+            Param::Noise => p.noise = x.clamp(0.0, 1.0),
+            Param::AmpA => p.amp.a = x.clamp(0.001, 4.0),
+            Param::AmpD => p.amp.d = x.clamp(0.001, 4.0),
+            Param::AmpS => p.amp.s = x.clamp(0.0, 1.0),
+            Param::AmpR => p.amp.r = x.clamp(0.001, 4.0),
+            Param::Cutoff => p.cutoff = x.clamp(20.0, 18000.0),
+            Param::Resonance => p.resonance = x.clamp(0.0, 1.0),
+            Param::FiltEnvAmt => p.filter_env_amount = x.clamp(0.0, 1.0),
+            Param::FiltA => p.filter_env.a = x.clamp(0.001, 4.0),
+            Param::FiltD => p.filter_env.d = x.clamp(0.001, 4.0),
+            Param::FiltS => p.filter_env.s = x.clamp(0.0, 1.0),
+            Param::FiltR => p.filter_env.r = x.clamp(0.001, 4.0),
+            Param::PitchLfoRate => p.pitch_lfo_rate = x.clamp(0.02, 20.0),
+            Param::PitchLfoDepth => p.pitch_lfo_depth = x.clamp(0.0, 12.0),
+            Param::FiltLfoRate => p.filter_lfo_rate = x.clamp(0.02, 20.0),
+            Param::FiltLfoDepth => p.filter_lfo_depth = x.clamp(0.0, 1.0),
+            Param::Glide => p.glide = x.clamp(0.0, 1.0),
+            Param::Spread => p.spread = x.clamp(0.0, 1.0),
+            Param::Master => p.master = x.clamp(0.0, 0.6),
+        }
+        true
+    }
+}
+
+/// Every editable synth parameter, in editor order.
+fn all_params() -> Vec<Param> {
+    synth_columns()
+        .iter()
+        .flat_map(|col| column_params(col))
+        .collect()
+}
+
+fn param_by_key(key: &str) -> Option<Param> {
+    all_params().into_iter().find(|p| p.key() == key)
 }
 
 fn pct(v: f32) -> String {
@@ -273,7 +430,9 @@ fn synth_columns() -> [Vec<Item>; 3] {
             Item::Head("FILTER LFO"),
             Item::P("rate", FiltLfoRate),
             Item::P("depth", FiltLfoDepth),
-            Item::Head("MASTER"),
+            Item::Head("GLOBAL"),
+            Item::P("glide", Glide),
+            Item::P("spread", Spread),
             Item::P("volume", Master),
         ],
     ]
@@ -299,7 +458,7 @@ struct ChordOptions {
     bass: Option<i32>,
     arp_on: bool,
     arp_pattern: ArpPattern,
-    arp_length: u32,
+    arp_len: usize, // index into ARP_LENGTHS
     arp_triplet: bool,
 }
 
@@ -312,7 +471,7 @@ impl Default for ChordOptions {
             bass: None,
             arp_on: false,
             arp_pattern: ArpPattern::Up,
-            arp_length: 1,
+            arp_len: ARP_LEN_DEFAULT,
             arp_triplet: false,
         }
     }
@@ -357,8 +516,8 @@ pub struct App {
     arp_on: bool,
     /// Arpeggiator pattern (`1`/`2`) — locked per note.
     arp_pattern: ArpPattern,
-    /// Arp phrase length: each note lasts this many grid steps (`3`/`4`).
-    arp_length: u32,
+    /// Arp phrase length as an index into `ARP_LENGTHS` (`3`/`4`).
+    arp_len: usize,
     /// Triplet feel (`5`): 16th-triplet grid instead of straight 16ths.
     arp_triplet: bool,
     /// Shared clock: tempo + beat grid, synced across instances (↑/↓ set it).
@@ -374,10 +533,15 @@ pub struct App {
     sent: Vec<u8>,
     /// The synth patch (edited in the Synth view, pushed to the audio thread).
     patch: Patch,
+    /// Text control interface for agents (state files + command inbox).
+    control: Control,
     /// Which screen is showing, and the synth-editor cursor `(column, row)`.
     view: View,
     synth_col: usize,
     synth_row: usize,
+    /// Fallback lead/bass one-shot: when set, the current (single, un-chorded)
+    /// note auto-releases at this time instead of latching.
+    lead_off: Option<Instant>,
     /// Key physically held right now (Kitty only); `None` when nothing is held
     /// or a chord is only ringing via latch.
     held: Option<char>,
@@ -416,7 +580,7 @@ impl App {
             window: 0,
             arp_on: false,
             arp_pattern: ArpPattern::Up,
-            arp_length: 1,
+            arp_len: ARP_LEN_DEFAULT,
             arp_triplet: false,
             transport,
             arp_pos: 0,
@@ -425,9 +589,11 @@ impl App {
             rng: 0x9E3779B9,
             sent: Vec::new(),
             patch,
+            control: Control::new(),
             view: View::Play,
             synth_col: 0,
             synth_row: 0,
+            lead_off: None,
             held: None,
             current: None,
             last_button: None,
@@ -632,10 +798,14 @@ impl App {
     }
 
     fn press(&mut self, key: char, root: u8) {
+        // Fallback lead/bass mode (no chord selected): every hit is a fresh
+        // brief note, so skip the re-press short-circuit and always re-play.
+        let lead_mode = !self.enhanced && self.quality.is_none();
+
         // Re-pressing the key that's already sounding *at the same pitch* — a
         // key-repeat or redundant press. (If transpose has since moved this key
         // to a new pitch, fall through and re-trigger at that pitch.)
-        if matches!(&self.current, Some(h) if h.key == key && h.root == root) {
+        if !lead_mode && matches!(&self.current, Some(h) if h.key == key && h.root == root) {
             self.held = Some(key);
             // A locked note snaps back to its saved config, undoing any
             // ephemeral edits (revoice is a no-op if nothing changed).
@@ -643,10 +813,13 @@ impl App {
                 self.apply(lock);
                 self.revoice();
             }
-            // Re-clicking restarts the arp pattern (from the next step, so it
-            // stays on the grid).
             if self.arp_on {
-                self.arp_pos = 0;
+                self.arp_pos = 0; // re-click restarts the arp pattern (on the grid)
+            } else if self.enhanced {
+                // Re-hitting a ringing (latched/held) chord re-strikes it — the
+                // synth re-gates its envelopes. Kitty only, so fallback
+                // key-repeat can't machine-gun it.
+                self.retrigger();
             }
             return;
         }
@@ -671,6 +844,14 @@ impl App {
             // Chord mode, or (re)starting the arp from a strum/silence.
             self.play(key, root); // silences the previous chord itself
         }
+
+        // In the fallback with no chord selected, a note is a brief one-shot
+        // (lead/bass) rather than a latched chord.
+        self.lead_off = if !self.enhanced && !self.arp_on && self.quality.is_none() {
+            Some(Instant::now() + LEAD_GATE)
+        } else {
+            None
+        };
     }
 
     /// Lock the current chord config to the current key (keyed by the physical
@@ -709,7 +890,7 @@ impl App {
         self.bass = cfg.bass;
         self.arp_on = cfg.arp_on;
         self.arp_pattern = cfg.arp_pattern;
-        self.arp_length = cfg.arp_length;
+        self.arp_len = cfg.arp_len;
         self.arp_triplet = cfg.arp_triplet;
     }
 
@@ -722,7 +903,7 @@ impl App {
             bass: self.bass,
             arp_on: self.arp_on,
             arp_pattern: self.arp_pattern,
-            arp_length: self.arp_length,
+            arp_len: self.arp_len,
             arp_triplet: self.arp_triplet,
         }
     }
@@ -795,9 +976,10 @@ impl App {
                     self.send_off(*note);
                 }
             }
-            for note in &new {
+            let count = new.len();
+            for (i, note) in new.iter().enumerate() {
                 if !old.contains(note) {
-                    self.send_on(root, *note);
+                    self.send_on(root, *note, self.spread_pan(i, count));
                 }
             }
         }
@@ -863,8 +1045,9 @@ impl App {
             // step in lockstep with any other instances.
             self.last_step = self.arp_note_step();
         } else {
-            for &note in &notes {
-                self.send_on(root, note);
+            let count = notes.len();
+            for (i, &note) in notes.iter().enumerate() {
+                self.send_on(root, note, self.spread_pan(i, count));
             }
         }
         self.current = Some(Held { key, root, notes });
@@ -874,6 +1057,22 @@ impl App {
         self.silence();
         self.current = None;
         self.arp_sounding = None;
+        self.lead_off = None;
+    }
+
+    /// Re-strike the currently sounding chord: re-send NoteOn for each tone so
+    /// the synth restarts its amp/filter envelopes (no note-off, so no gap).
+    fn retrigger(&mut self) {
+        let (root, notes) = match self.current.as_ref() {
+            Some(h) => (h.root, h.notes.clone()),
+            None => return,
+        };
+        let count = notes.len();
+        for (i, &id) in notes.iter().enumerate() {
+            let freq = tone_frequency(root, id, self.just);
+            let pan = self.spread_pan(i, count);
+            let _ = self.tx.send(SynthEvent::NoteOn { id, freq, pan });
+        }
     }
 
     /// Note-off everything currently sounding.
@@ -883,12 +1082,23 @@ impl App {
         }
     }
 
-    /// Start tone `id`, tuned relative to `root` for the active temperament.
-    fn send_on(&mut self, root: u8, id: u8) {
+    /// Start tone `id`, tuned relative to `root`, panned by `pan` (stereo spread).
+    fn send_on(&mut self, root: u8, id: u8, pan: f32) {
         if !self.sent.contains(&id) {
             let freq = tone_frequency(root, id, self.just);
-            let _ = self.tx.send(SynthEvent::NoteOn { id, freq });
+            let _ = self.tx.send(SynthEvent::NoteOn { id, freq, pan });
             self.sent.push(id);
+        }
+    }
+
+    /// Stereo-spread pan for the note at `index` of a chord of `count` notes:
+    /// symmetric around center so the chord never leans to one side, and
+    /// re-centered per chord (independent of where it sits on the keyboard).
+    fn spread_pan(&self, index: usize, count: usize) -> f32 {
+        if count <= 1 || self.patch.spread <= 0.0 {
+            0.0
+        } else {
+            self.patch.spread * (2.0 * index as f32 / (count - 1) as f32 - 1.0)
         }
     }
 
@@ -928,17 +1138,23 @@ impl App {
         }
     }
 
-    /// The current arp note index on the shared grid (one note every
-    /// `arp_length` subdivisions), so a longer phrase = fewer notes per beat.
-    fn arp_note_step(&self) -> i64 {
-        let pos = self.transport.step_position(self.arp_subdiv());
-        (pos / self.arp_length.max(1) as f64).floor() as i64
+    fn arp_length(&self) -> f32 {
+        ARP_LENGTHS[self.arp_len.min(ARP_LENGTHS.len() - 1)]
     }
 
-    /// Change the arp phrase length by `delta` note-steps; re-anchor the clock
-    /// so it doesn't fire a burst, and persist to the working brush.
+    /// The current arp note index on the shared grid: one note every
+    /// `arp_length` subdivisions. Below 1 fires faster than the grid (32nd…),
+    /// above fires slower (8th, quarter, …).
+    fn arp_note_step(&self) -> i64 {
+        let pos = self.transport.step_position(self.arp_subdiv());
+        (pos / self.arp_length() as f64).floor() as i64
+    }
+
+    /// Move the phrase length `delta` steps through `ARP_LENGTHS` (`3` faster,
+    /// `4` slower); re-anchor the clock so it doesn't burst, and persist.
     fn adjust_arp_length(&mut self, delta: i32) {
-        self.arp_length = (self.arp_length as i32 + delta).clamp(1, ARP_LENGTH_MAX as i32) as u32;
+        self.arp_len =
+            (self.arp_len as i32 + delta).clamp(0, ARP_LENGTHS.len() as i32 - 1) as usize;
         self.last_step = self.arp_note_step();
         self.sync_working();
     }
@@ -955,6 +1171,14 @@ impl App {
     /// instance fires on the same beats at the same tempo.
     pub fn tick(&mut self) {
         self.transport.sync(); // pick up tempo/epoch changes from other instances
+
+        // Fallback lead/bass: release the brief one-shot note when its gate lapses.
+        if let Some(t) = self.lead_off {
+            if Instant::now() >= t {
+                self.stop_current();
+            }
+        }
+
         let step = self.arp_note_step();
         if !self.arp_on || self.current.is_none() {
             self.last_step = step; // stay caught up so the arp starts on the grid
@@ -983,7 +1207,9 @@ impl App {
         };
         self.arp_pos = self.arp_pos.wrapping_add(1);
         let note = pool[idx];
-        self.send_on(root, note);
+        // Spread by the note's position in the chord, so the arp sweeps across
+        // the stereo field as it climbs/descends.
+        self.send_on(root, note, self.spread_pan(idx, pool.len()));
         self.arp_sounding = Some(note);
     }
 
@@ -1018,6 +1244,236 @@ impl App {
             .copied()
             .filter(|&n| Some(n) != bass)
             .find(|&n| n % 12 == root_pc)
+    }
+
+    // --- Text control interface (agents/scripts) ---------------------------
+
+    /// Service the control files: apply queued commands, refresh the state file.
+    pub fn serve(&mut self) {
+        let commands = self.control.take_commands();
+        let had = !commands.is_empty();
+        for cmd in commands {
+            self.apply_command(&cmd);
+        }
+        let due = self.control.due();
+        if had || due {
+            let state = self.state_text();
+            self.control.publish(&state);
+        }
+    }
+
+    /// Remove this instance's control files on exit.
+    pub fn shutdown(&self) {
+        self.control.cleanup();
+    }
+
+    /// The full instance state as `key value` lines (the read-only view; every
+    /// key here is also a valid command).
+    fn state_text(&self) -> String {
+        use std::fmt::Write;
+        let mut s = String::new();
+        let _ = writeln!(s, "# autochord instance {}", std::process::id());
+        let _ = writeln!(s, "tempo {}", self.transport.tempo());
+        let _ = writeln!(s, "view {}", match self.view {
+            View::Play => "play",
+            View::Synth => "synth",
+        });
+        let _ = writeln!(s, "latch {}", onoff(self.latch));
+        let _ = writeln!(s, "tuning {}", if self.just { "just" } else { "et" });
+        let _ = writeln!(s, "transpose {}", self.window);
+        let _ = writeln!(s, "quality {}", quality_name(self.quality));
+        let adds: Vec<&str> = self.additions.iter().map(|a| addition_name(*a)).collect();
+        let _ = writeln!(s, "additions {}", if adds.is_empty() { "-".into() } else { adds.join(" ") });
+        let _ = writeln!(s, "voicing {}", self.voicing);
+        let _ = writeln!(s, "bass {}", match self.bass {
+            None => "off".to_string(),
+            Some(o) => o.to_string(),
+        });
+        let _ = writeln!(s, "arp {}", onoff(self.arp_on));
+        let _ = writeln!(s, "pattern {}", self.arp_pattern.label());
+        let _ = writeln!(s, "phrase {}", self.arp_length());
+        let _ = writeln!(s, "triplet {}", onoff(self.arp_triplet));
+        let _ = writeln!(s, "chord {}", {
+            let name = chord_description(self);
+            if name.is_empty() { "-".to_string() } else { name }
+        });
+        let notes: Vec<String> = self.active_notes().iter().map(|&n| note_name(n)).collect();
+        let _ = writeln!(s, "notes {}", if notes.is_empty() { "-".into() } else { notes.join(" ") });
+        // Synth-engine params, namespaced under the active engine's name.
+        let _ = writeln!(s, "engine {SYNTH_ENGINE}");
+        for p in all_params() {
+            let _ = writeln!(s, "{} {}", p.key(), p.raw(&self.patch));
+        }
+        s
+    }
+
+    /// Apply one `key value` command line from the inbox.
+    fn apply_command(&mut self, line: &str) {
+        let mut it = line.split_whitespace();
+        let Some(key) = it.next() else {
+            return;
+        };
+        let arg = it.next().unwrap_or("");
+        let rest: Vec<&str> = std::iter::once(arg).chain(it).filter(|s| !s.is_empty()).collect();
+        match key {
+            "tempo" => {
+                if let Ok(b) = arg.parse::<u32>() {
+                    self.transport.set_tempo(b.clamp(TEMPO_MIN, TEMPO_MAX));
+                }
+            }
+            "latch" => {
+                self.latch = arg == "on";
+                if !self.latch {
+                    self.stop_current();
+                }
+            }
+            "tuning" => self.just = arg == "just",
+            "transpose" => {
+                if let Ok(w) = arg.parse::<i32>() {
+                    self.window = w.clamp(-WINDOW_RANGE, WINDOW_RANGE);
+                }
+            }
+            "quality" => {
+                self.quality = parse_quality(arg);
+                self.sync_working();
+                self.revoice();
+            }
+            "additions" => {
+                self.additions = if arg == "-" || arg == "none" {
+                    Vec::new()
+                } else {
+                    rest.iter().filter_map(|s| addition_by_name(s)).collect()
+                };
+                self.sync_working();
+                self.revoice();
+            }
+            "voicing" => {
+                if let Ok(v) = arg.parse::<i32>() {
+                    self.voicing = v.clamp(-VOICING_RANGE, VOICING_RANGE);
+                    self.sync_working();
+                    self.revoice();
+                }
+            }
+            "bass" => {
+                self.bass = if arg == "off" {
+                    None
+                } else {
+                    arg.parse::<i32>().ok().map(|o| o.clamp(0, BASS_MAX))
+                };
+                self.sync_working();
+                self.revoice();
+            }
+            "arp" => self.set_arp(arg == "on"),
+            "pattern" => {
+                if let Some(p) = parse_pattern(arg) {
+                    self.arp_pattern = p;
+                    self.sync_working();
+                }
+            }
+            "phrase" => {
+                if let Ok(mult) = arg.parse::<f32>() {
+                    // snap to the nearest available phrase multiplier
+                    let idx = ARP_LENGTHS
+                        .iter()
+                        .enumerate()
+                        .min_by(|a, b| {
+                            (a.1 - mult).abs().partial_cmp(&(b.1 - mult).abs()).unwrap()
+                        })
+                        .map(|(i, _)| i)
+                        .unwrap_or(ARP_LEN_DEFAULT);
+                    self.arp_len = idx;
+                    self.last_step = self.arp_note_step();
+                    self.sync_working();
+                }
+            }
+            "triplet" => {
+                self.arp_triplet = arg == "on";
+                self.last_step = self.arp_note_step();
+                self.sync_working();
+            }
+            "play" => {
+                if let Some(root) = parse_note(arg) {
+                    self.current_locked = false;
+                    self.play('*', root);
+                }
+            }
+            "stop" => self.stop_current(),
+            other => {
+                if let Some(p) = param_by_key(other) {
+                    if p.set_raw(&mut self.patch, arg) {
+                        let _ = self.tx.send(SynthEvent::SetPatch(self.patch));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Set the arpeggiator on/off (command interface), re-playing in the new mode.
+    fn set_arp(&mut self, on: bool) {
+        if self.arp_on == on {
+            return;
+        }
+        self.arp_on = on;
+        self.sync_working();
+        if let Some((key, root)) = self.current.as_ref().map(|h| (h.key, h.root)) {
+            self.play(key, root);
+        }
+    }
+}
+
+fn onoff(v: bool) -> &'static str {
+    if v {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+fn quality_name(q: Option<Quality>) -> &'static str {
+    match q {
+        None => "none",
+        Some(Quality::Power) => "power",
+        Some(Quality::Dim) => "dim",
+        Some(Quality::Min) => "min",
+        Some(Quality::Maj) => "maj",
+        Some(Quality::Sus) => "sus",
+    }
+}
+
+fn parse_quality(s: &str) -> Option<Quality> {
+    match s {
+        "power" | "5" => Some(Quality::Power),
+        "dim" => Some(Quality::Dim),
+        "min" | "m" => Some(Quality::Min),
+        "maj" => Some(Quality::Maj),
+        "sus" | "sus4" => Some(Quality::Sus),
+        _ => None, // "none" and anything else = no chord
+    }
+}
+
+fn addition_name(a: Addition) -> &'static str {
+    ADDITIONS
+        .iter()
+        .find(|(_, add, _)| *add == a)
+        .map(|(_, _, label)| *label)
+        .unwrap_or("?")
+}
+
+fn addition_by_name(s: &str) -> Option<Addition> {
+    // Exact match — `m7` and `M7` differ only by case.
+    ADDITIONS
+        .iter()
+        .find(|(_, _, label)| *label == s)
+        .map(|(_, a, _)| *a)
+}
+
+fn parse_pattern(s: &str) -> Option<ArpPattern> {
+    match s {
+        "up" => Some(ArpPattern::Up),
+        "down" => Some(ArpPattern::Down),
+        "updown" | "up-down" => Some(ArpPattern::UpDown),
+        "random" => Some(ArpPattern::Random),
+        _ => None,
     }
 }
 
@@ -1153,7 +1609,13 @@ fn phrase_line(app: &App) -> Line<'static> {
             Style::default().fg(Color::DarkGray)
         }
     };
-    spans.push(Span::styled(format!("×{}", app.arp_length), val(app.arp_length > 1)));
+    let mult = app.arp_length();
+    let mult_label = if mult < 1.0 {
+        format!("÷{}", (1.0 / mult).round() as i32)
+    } else {
+        format!("×{}", mult as i32)
+    };
+    spans.push(Span::styled(mult_label, val((mult - 1.0).abs() > f32::EPSILON)));
     spans.push(Span::styled("     5 ", Style::default().fg(Color::DarkGray)));
     spans.push(Span::styled("triplet ", Style::default().fg(Color::Yellow)));
     spans.push(Span::styled(
@@ -1674,19 +2136,65 @@ mod tests {
         assert_eq!(a.arp_pos, 0); // restarted
     }
 
+    // spread pans are symmetric around center (never lopsided), single = center
+    #[test]
+    fn spread_pan_is_centered_and_symmetric() {
+        let mut a = app();
+        a.patch.spread = 1.0;
+        assert_eq!(a.spread_pan(0, 1), 0.0); // lone note dead center
+        assert_eq!(a.spread_pan(0, 3), -1.0); // lowest hard left
+        assert_eq!(a.spread_pan(2, 3), 1.0); // highest hard right
+        assert_eq!(a.spread_pan(1, 3), 0.0); // middle center
+        let sum: f32 = (0..5).map(|i| a.spread_pan(i, 5)).sum();
+        assert!(sum.abs() < 1e-6, "spread should balance to center");
+    }
+
+    // fallback: a single note is a brief one-shot; a chord latches
+    #[test]
+    fn fallback_single_note_is_brief_chord_latches() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let monitor = Arc::new(VoiceMonitor::new());
+        let audio = AudioInfo { device: "test".into(), sample_rate: 48000 };
+        // enhanced = false -> release fallback
+        let mut a = App::new(tx, audio, false, true, monitor, Transport::disconnected());
+        tap(&mut a, 'z'); // single note, no chord -> brief
+        assert!(a.lead_off.is_some());
+        tap(&mut a, '9'); // select maj
+        tap(&mut a, 'x'); // play a chord -> latches
+        assert!(a.lead_off.is_none());
+    }
+
+    // re-hitting a latched chord (Kitty) re-strikes it: NoteOn is re-sent
+    #[test]
+    fn latch_rehit_retriggers() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let monitor = Arc::new(VoiceMonitor::new());
+        let audio = AudioInfo { device: "test".into(), sample_rate: 48000 };
+        let mut a = App::new(tx, audio, true, true, monitor, Transport::disconnected());
+        tap(&mut a, 'z'); // play C (latched)
+        while rx.try_recv().is_ok() {} // drain the initial NoteOns
+        tap(&mut a, 'z'); // re-hit the same chord
+        let note_ons = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|e| matches!(e, SynthEvent::NoteOn { .. }))
+            .count();
+        assert!(note_ons >= 1, "re-hit should re-send NoteOn to retrigger");
+    }
+
     // 3/4 shrink/extend the phrase (clamped at 1), 5 toggles triplet
     #[test]
     fn arp_phrase_controls() {
         let mut a = app();
-        assert_eq!(a.arp_length, 1);
+        assert_eq!(a.arp_length(), 1.0); // default ×1
         a.adjust_arp_length(1);
-        assert_eq!(a.arp_length, 2);
-        a.adjust_arp_length(1);
-        assert_eq!(a.arp_length, 3);
+        assert_eq!(a.arp_length(), 2.0); // ×2 (slower)
         a.adjust_arp_length(-1);
-        assert_eq!(a.arp_length, 2);
+        assert_eq!(a.arp_length(), 1.0);
+        a.adjust_arp_length(-1);
+        assert_eq!(a.arp_length(), 0.5); // ÷2 (faster)
         a.adjust_arp_length(-10);
-        assert_eq!(a.arp_length, 1); // clamped
+        assert_eq!(a.arp_length(), 0.125); // clamped to ÷8
+        a.adjust_arp_length(100);
+        assert_eq!(a.arp_length(), 8.0); // clamped to ×8
         assert!(!a.arp_triplet);
         a.toggle_triplet();
         assert!(a.arp_triplet);
@@ -1697,17 +2205,17 @@ mod tests {
     fn arp_phrase_locks_with_backtick() {
         let mut a = app();
         tap(&mut a, '/'); // arp on
-        a.adjust_arp_length(1); // len 2
+        a.adjust_arp_length(1); // ×2
         a.toggle_triplet(); // triplet on
-        tap(&mut a, 'z'); // play C with len2/triplet
+        tap(&mut a, 'z'); // play C with ×2/triplet
         tap(&mut a, '`'); // lock C
-        a.adjust_arp_length(1); // brush -> len 3
+        a.adjust_arp_length(1); // brush -> ×3
         a.toggle_triplet(); // brush -> straight
         tap(&mut a, 'n'); // play A (brush)
-        assert_eq!(a.arp_length, 3);
+        assert_eq!(a.arp_length(), 3.0);
         assert!(!a.arp_triplet);
         tap(&mut a, 'z'); // recall locked C
-        assert_eq!(a.arp_length, 2);
+        assert_eq!(a.arp_length(), 2.0);
         assert!(a.arp_triplet);
     }
 
@@ -1726,5 +2234,51 @@ mod tests {
         tap(&mut a, 'z'); // recall locked C
         assert!(a.arp_on);
         assert_eq!(a.arp_pattern, ArpPattern::Down);
+    }
+
+    // Text commands mutate the same state the piano keys do, and the
+    // republished state round-trips through the same keys.
+    #[test]
+    fn control_commands_apply_and_round_trip() {
+        let mut a = app();
+
+        a.apply_command("tempo 96");
+        assert_eq!(a.transport.tempo(), 96);
+
+        a.apply_command("quality min");
+        assert_eq!(a.quality, Some(Quality::Min));
+
+        a.apply_command("additions m7 9");
+        assert_eq!(a.additions.len(), 2);
+        // `m7` and `M7` differ only by case — must not collide.
+        a.apply_command("additions M7");
+        assert_eq!(a.additions, vec![Addition::Maj7]);
+
+        a.apply_command("arp on");
+        assert!(a.arp_on);
+        a.apply_command("pattern down");
+        assert_eq!(a.arp_pattern, ArpPattern::Down);
+
+        a.apply_command("subtractive.filter.cutoff 3000");
+        assert!((a.patch.cutoff - 3000.0).abs() < 1.0);
+        a.apply_command("subtractive.osc1.wave sqr");
+        assert_eq!(a.patch.osc[0].wave, Wave::Square);
+
+        a.apply_command("play C4");
+        assert_eq!(root(&a), 60);
+
+        // Unknown keys and junk values are ignored, not fatal.
+        a.apply_command("bogus 123");
+        a.apply_command("subtractive.filter.cutoff notanumber");
+        assert!((a.patch.cutoff - 3000.0).abs() < 1.0);
+
+        // The published state exposes those same keys.
+        let s = a.state_text();
+        assert!(s.contains("tempo 96"));
+        assert!(s.contains("quality min"));
+        assert!(s.contains("arp on"));
+        assert!(s.contains("engine subtractive"));
+        assert!(s.contains("subtractive.filter.cutoff 3000"));
+        assert!(s.contains("subtractive.osc1.wave sqr"));
     }
 }

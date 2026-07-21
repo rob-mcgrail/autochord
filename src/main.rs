@@ -6,6 +6,7 @@
 
 mod app;
 mod audio;
+mod control;
 mod notes;
 mod synth;
 mod transport;
@@ -36,9 +37,48 @@ use transport::Transport;
 /// UI refresh / input-poll interval (~60 Hz).
 const TICK: Duration = Duration::from_millis(16);
 
+/// The agent skill, installed into `.claude/skills/autochord/` by the
+/// `install-skill` subcommand.
+const SKILL: &str = include_str!("../skill/SKILL.md");
+
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Non-TUI subcommands: the text control interface for agents/scripts.
+    match args.first().map(String::as_str) {
+        Some("state") => {
+            let pid = args.get(1).and_then(|s| s.parse().ok());
+            print!("{}", control::cli_state(pid));
+            return Ok(());
+        }
+        Some("send") => {
+            let Some(pid) = args.get(1).and_then(|s| s.parse::<u32>().ok()) else {
+                eprintln!("usage: autochord send <pid> <key> <value>");
+                std::process::exit(2);
+            };
+            let command = args[2..].join(" ");
+            control::cli_send(pid, &command)?;
+            return Ok(());
+        }
+        Some("ls") => {
+            for pid in control::live_instances() {
+                println!("{pid}");
+            }
+            return Ok(());
+        }
+        Some("install-skill") => {
+            install_skill()?;
+            return Ok(());
+        }
+        Some("help" | "--help" | "-h") => {
+            print_help();
+            return Ok(());
+        }
+        _ => {}
+    }
+
     // Just intonation is on by default; disable it for plain 12-TET.
-    let just = !std::env::args().skip(1).any(|a| {
+    let just = !args.iter().any(|a| {
         matches!(
             a.as_str(),
             "--et" | "--equal" | "--equal-temperament" | "--no-just"
@@ -63,6 +103,7 @@ fn main() -> Result<()> {
     let result = run(&mut terminal, &mut app);
 
     restore_terminal(enhanced)?;
+    app.shutdown(); // remove this instance's control files
     // `_stream` drops here, stopping audio.
     result
 }
@@ -77,8 +118,35 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Resu
             }
         }
         app.tick(); // advance the arpeggiator clock
+        app.serve(); // publish state / apply queued agent commands
     }
     Ok(())
+}
+
+/// Write the agent skill into `./.claude/skills/autochord/SKILL.md`.
+fn install_skill() -> Result<()> {
+    let dir = std::path::Path::new(".claude/skills/autochord");
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join("SKILL.md");
+    std::fs::write(&path, SKILL)?;
+    println!("installed skill -> {}", path.display());
+    Ok(())
+}
+
+fn print_help() {
+    println!(
+        "autochord — terminal chord synth\n\
+         \n\
+         autochord                 run the TUI\n\
+         autochord --et            run in 12-TET (no just intonation)\n\
+         autochord state [pid]     print live state (all instances, or one)\n\
+         autochord send <pid> ...  send a `key value` command to an instance\n\
+         autochord ls              list running instance PIDs\n\
+         autochord install-skill   write the agent skill into ./.claude/skills\n\
+         \n\
+         State/commands live as text files in {}",
+        control::dir().display()
+    );
 }
 
 fn setup_terminal(enhanced: bool) -> Result<Terminal<CrosstermBackend<Stdout>>> {

@@ -44,6 +44,45 @@ pub fn note_for_key(c: char, window: i32) -> Option<u8> {
     u8::try_from(midi).ok().filter(|&m| m <= 127)
 }
 
+/// Parse a note into a MIDI number: a raw number (`60`) or a name like `C4`,
+/// `C#3`, `Bb5` (octave defaults to 4, C4 = 60).
+pub fn parse_note(s: &str) -> Option<u8> {
+    let s = s.trim();
+    if let Ok(n) = s.parse::<u8>() {
+        return Some(n);
+    }
+    let bytes = s.as_bytes();
+    let base = match bytes.first()?.to_ascii_uppercase() {
+        b'C' => 0,
+        b'D' => 2,
+        b'E' => 4,
+        b'F' => 5,
+        b'G' => 7,
+        b'A' => 9,
+        b'B' => 11,
+        _ => return None,
+    };
+    let mut i = 1;
+    let mut semis = base;
+    match bytes.get(i) {
+        Some(b'#') => {
+            semis += 1;
+            i += 1;
+        }
+        Some(b'b') => {
+            semis -= 1;
+            i += 1;
+        }
+        _ => {}
+    }
+    let octave: i32 = if i < bytes.len() {
+        s.get(i..)?.parse().ok()?
+    } else {
+        4
+    };
+    u8::try_from((octave + 1) * 12 + semis).ok()
+}
+
 /// Note-letter name of a pitch class (0 = C … 11 = B), using sharps.
 pub fn pitch_class_name(pc: u8) -> &'static str {
     const NAMES: [&str; 12] = [

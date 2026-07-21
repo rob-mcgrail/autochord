@@ -14,7 +14,7 @@ use crate::synth::{Patch, Synth, VoiceMonitor};
 /// identified by its MIDI note `id` (for on/off matching); `freq` carries the
 /// actual, possibly just-intoned, pitch.
 pub enum SynthEvent {
-    NoteOn { id: u8, freq: f32 },
+    NoteOn { id: u8, freq: f32, pan: f32 },
     NoteOff { id: u8 },
     SetPatch(Patch),
 }
@@ -77,7 +77,7 @@ where
             // `try_recv` never blocks, so this is real-time safe.
             while let Ok(event) = rx.try_recv() {
                 match event {
-                    SynthEvent::NoteOn { id, freq } => synth.note_on(id, freq),
+                    SynthEvent::NoteOn { id, freq, pan } => synth.note_on(id, freq, pan),
                     SynthEvent::NoteOff { id } => synth.note_off(id),
                     SynthEvent::SetPatch(patch) => synth.set_patch(patch),
                 }

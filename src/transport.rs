@@ -97,25 +97,33 @@ fn now_ms() -> u64 {
 }
 
 fn shared_path() -> PathBuf {
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "default".to_string());
-    std::env::temp_dir().join(format!("autochord-transport-{user}"))
+    crate::control::global_path()
 }
 
+/// Parse the readable `key value` global file (`tempo <bpm>`, `epoch_ms <n>`).
 fn read(path: &PathBuf) -> Option<(u32, u64)> {
     let text = std::fs::read_to_string(path).ok()?;
-    let mut fields = text.split_whitespace();
-    let tempo = fields.next()?.parse().ok()?;
-    let epoch = fields.next()?.parse().ok()?;
-    Some((tempo, epoch))
+    let mut tempo = None;
+    let mut epoch = None;
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        match (it.next(), it.next()) {
+            (Some("tempo"), Some(v)) => tempo = v.parse().ok(),
+            (Some("epoch_ms"), Some(v)) => epoch = v.parse().ok(),
+            _ => {}
+        }
+    }
+    Some((tempo?, epoch?))
 }
 
 fn write(path: &PathBuf, tempo: u32, epoch_ms: u64) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     // Write to a pid-tagged temp file then rename — an atomic swap, so a
     // concurrent reader never sees a half-written line.
-    let tmp = path.with_file_name(format!("autochord-transport.{}.tmp", std::process::id()));
-    if std::fs::write(&tmp, format!("{tempo} {epoch_ms}\n")).is_ok() {
+    let tmp = path.with_file_name(format!("global.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, format!("tempo {tempo}\nepoch_ms {epoch_ms}\n")).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }
 }
