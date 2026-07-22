@@ -11,12 +11,15 @@ use cpal::{FromSample, SizedSample};
 use crate::synth::{Patch, Synth, VoiceMonitor};
 
 /// Commands sent from the UI thread to the real-time audio thread. A tone is
-/// identified by its MIDI note `id` (for on/off matching); `freq` carries the
+/// identified by its voice `id` — high byte = source (0 = live, 1..=N = loop
+/// slots), low byte = MIDI note — for on/off matching; `freq` carries the
 /// actual, possibly just-intoned, pitch.
 pub enum SynthEvent {
-    NoteOn { id: u8, freq: f32, pan: f32 },
-    NoteOff { id: u8 },
+    NoteOn { id: u16, freq: f32, pan: f32 },
+    NoteOff { id: u16 },
     SetPatch(Patch),
+    /// A metronome click (count-in). `accent` marks the downbeat (higher pip).
+    Click { accent: bool },
 }
 
 /// Details about the running output stream, shown in the UI.
@@ -80,6 +83,7 @@ where
                     SynthEvent::NoteOn { id, freq, pan } => synth.note_on(id, freq, pan),
                     SynthEvent::NoteOff { id } => synth.note_off(id),
                     SynthEvent::SetPatch(patch) => synth.set_patch(patch),
+                    SynthEvent::Click { accent } => synth.click(accent),
                 }
             }
 

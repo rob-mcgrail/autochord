@@ -49,8 +49,16 @@ arp on
 pattern up
 phrase 1
 triplet off
+timesig 4/4
+field tempo
 chord Cmaj9
 notes C4 E4 G4 B4 D5
+loop1 empty 0bars 0layers
+loop2 playing 2bars 2layers quantize 1/16 div 1/1 speed 1.00x transpose 0
+loop2.layer1 C4@0:1 E4@1:1 G4@2:2
+loop2.layer2 C3@0:8
+loop3 empty 0bars 0layers
+loop4 empty 0bars 0layers
 patch 0
 patch.name Warm Bloom
 engine subtractive
@@ -88,6 +96,7 @@ confirm the effect.
 ### Commands
 
 - `tempo <bpm>` — global (affects all instances)
+- `timesig 4/4|3/4` — bar length the loop recorder locks to
 - `latch on|off`, `tuning just|et`, `transpose <white-key-steps>`
 - `quality none|power|dim|min|maj|sus`
 - `additions <list>` — e.g. `additions m7 9`; `additions -` to clear
@@ -96,6 +105,24 @@ confirm the effect.
 - `arp on|off`, `pattern up|down|updown|random`, `phrase <mult>`
   (`0.125 0.25 0.5 1 2 3 4 …`), `triplet on|off`
 - `play <note>` (e.g. `play C4`, `play F#3`, `play 60`), `stop`
+- `field <name>` — move the play-page selection cursor: `tempo`, `timesig`,
+  `keyboard`, or `loopN[.mute|.solo|.undo|.div|.speed|.transpose|.reset]`
+- `loopN <action>` — the multitrack looper (N = 1..4). Actions:
+  `record` (start → stop → overdub, same as pressing the loop's Space button),
+  `stop`, `mute`, `unmute`, `solo`, `unsolo`, `undo` (drop last layer),
+  `reset` (wipe to empty).
+- `loopN quantize <free|1/4|1/8|1/8T|1/16|1/16T|1/32>` — snap playback to a grid
+  (non-destructive; `free` = as recorded). `loopN div <1/1|1/2|1/4|1/8>` — play
+  only that fraction of the loop (repeats sooner); `loopN speed <mult>` —
+  playback rate 0.25–4 (e.g. `speed 1.5`); `loopN transpose <semitones>` —
+  shift the loop's pitch (−24..24).
+- `loopN define <bars> <note@beat:dur> ...` — **author a loop directly** (no
+  real-time recording): create/replace slot N with a loop `bars` bars long from
+  a list of notes. `note` is a name or MIDI number, `beat` is the start (in
+  beats from the loop's downbeat), `dur` the length in beats. e.g.
+  `autochord send <pid> loop1 define 1 C4@0:1 E4@1:1 G4@2:2`
+- `loopN layer <note@beat:dur> ...` — overdub another authored layer onto an
+  existing loop (beats within its current length).
 - `patch <index-or-name>` — select a config slot by index (`patch 3`) or name
   (`patch Reese Bass`, case-insensitive). `autochord patches` lists them. The
   synth glides into the new patch over ~a beat rather than jumping.
@@ -108,6 +135,13 @@ confirm the effect.
   `subtractive.filterenv.attack|decay|sustain|release`,
   `subtractive.pitchlfo.rate|depth`, `subtractive.filterlfo.rate|depth`,
   `subtractive.glide`, `subtractive.spread`, `subtractive.master`
+
+**Loops** are baked note-tapes, layered (overdub), phase-locked to the
+transport, and each slot plays on its own voice channel so they layer without
+clashing. Each slot reads back as `loopN <empty|armed|rec|playing> <bars>bars
+<layers>layers [quantize <q> div <d> speed <s>x transpose <t>] [muted] [solo]`,
+followed by one `loopN.layerK <note@beat:dur> ...` line per layer — the same
+format `define` takes, so loops round-trip through the interface.
 
 Unknown keys and unparseable values are ignored. Values are clamped to valid
 ranges.

@@ -60,8 +60,8 @@ temperament instead — where pure-sine major thirds beat noticeably.
 Two dials reshape the chord — the Orchid's signature move. They're **sticky
 across chords**, so a voicing character carries as you change roots.
 
-- **Chord Voicing** (`-` / `+`): an inversion cascade. `+` lifts the current
-  *lowest* note up an octave; `-` drops the current *highest* down an octave.
+- **Chord Voicing** (`;` / `'`): an inversion cascade. `'` lifts the current
+  *lowest* note up an octave; `;` drops the current *highest* down an octave.
   The note count is preserved, so the voicing rolls through inversions and
   spreads well past one octave. Because it moves whichever note is currently
   lowest/highest (not always the root), the stepping is loose and exploratory —
@@ -88,6 +88,20 @@ through a locked note doesn't disturb your **working** config either — the nex
 non-locked note resumes whatever you had before. The `locked` row up top lists
 the memories (highlighting the one backtick will unlock).
 
+### The navigable field grid
+
+Below the chord controls is a **selection grid** you drive with the arrow keys.
+The top-right of the screen carries the transport row — **Tempo · Time Sig ·
+Keys** — and below the chord controls sit the four **loop lanes**. `←`/`→` move
+across a row, `↑`/`↓` move between rows, and **`+` / `-`** (or `<` / `>`,
+`,` / `.`) adjust the selected transport field:
+
+- **Tempo** — ±1 BPM (starts at 120; shared across instances).
+- **Time Sig** — toggles 4/4 ↔ 3/4 (sets the bar length loops lock to).
+- **Keys** — transposes the whole keyboard a white-key step at a time (the
+  piano keys and locks shift with it; a physically **held** key re-pitches
+  live, a latched/ringing chord stays put). Shown as `z:C4 +n`.
+
 ### Arpeggiator
 
 `/` toggles the arpeggiator: instead of sounding a chord all at once, it plays
@@ -95,10 +109,9 @@ the voiced notes one at a time in a pattern. `1` / `2` cycle the pattern
 (**up**, **down**, **up-down**, **random**); **`3` / `4`** change the phrase
 length — `4` slows it down (`×2 … ×8`, longer notes) and `3` speeds it up
 (`÷2 ÷4 ÷8`, down to 128th-note buzzes); **`5`** toggles a **triplet** feel
-(16th-triplet grid). The **↑** /
-**↓** arrows set the global tempo (starts at 120 BPM). Arp on/off, pattern,
-phrase length and triplet are all part of the per-note lock, so one key can be a
-strummed chord and another a triplet arpeggio — but tempo stays global.
+(16th-triplet grid). Arp on/off, pattern, phrase length and triplet are all part
+of the per-note lock, so one key can be a strummed chord and another a triplet
+arpeggio — but tempo stays global.
 
 The arp runs off a shared wall-clock grid, so changing chords (or re-hitting
 the current one to restart the pattern) swaps in on the **next step** — it stays
@@ -107,17 +120,46 @@ on the grid and the pulse never drifts.
 **Multiple instances stay in sync.** Tempo and the beat grid live in a small
 per-user file (`$TMPDIR/autochord-<user>/global`); every autochord process on
 the machine derives its arp steps from that shared epoch and tempo, so two (or
-more) instances arpeggiate in exact lockstep. Change the tempo (↑/↓) in any one
-and the others follow within a moment.
+more) instances arpeggiate in exact lockstep. Change the tempo in any one and
+the others follow within a moment.
 
-### Transpose
+### Loop recorder
 
-`<` / `>` (or `,` / `.`, no shift needed) transpose the whole keyboard a
-semitone at a time — the piano keys and locks all shift with it. A key you're
-physically **holding** re-pitches live as you transpose; a chord that's only
-**ringing** via latch stays put (and in a fallback terminal, where holds can't
-be detected, transpose only affects the next note you play). Shown as
-`transpose ±n` in the status line.
+Four **loop lanes** sit below the chord controls — a keyboard-driven multitrack
+looper. Navigate to a lane with the arrows and press **Space** on its `loop`
+cell to record:
+
+1. **Space** starts recording — always on the next **bar** line. The very first
+   loop gets a one-bar **count-in** (quarter-note pips, accented downbeat) so
+   you start clean; the lane shows `count 4…3…` then `REC`.
+2. **Space** again ends it, snapped to a whole number of bars — while it plays
+   out the rest of the bar the lane turns **yellow** (`ending`), then the loop
+   starts cycling, phase-locked to the transport.
+3. From then on **Space overdubs** another layer onto the same loop.
+
+Loops **bake the notes that actually sounded**, so whatever you did — chords,
+single notes, arpeggios, voicing/bass/addition changes mid-pass, or a chord
+already latched when you hit record — is captured, and each of the four slots
+is fully independent (one can arpeggiate while another holds chords). Each slot
+plays on its own voice channel, so layering never clashes.
+
+Arrow **right** from a recorded lane through its cells:
+
+- **mute · solo · undo · reset** — press **Space** to fire them: `mute`
+  silences the lane, `solo` silences the others, `undo` drops the last overdub
+  layer, `reset` wipes the slot back to empty.
+- **quantize · div · speed · transpose** — adjust with **`+` / `-`**:
+  `quantize` snaps playback to a grid (`free`, or 1/4 … 1/32 incl. triplets;
+  default 1/16) and is **non-destructive** — set it back to `free` to hear the
+  loop exactly as recorded; `div` plays only a fraction of the loop so it
+  repeats sooner (1/1 · 1/2 · 1/4 · 1/8); `speed` changes the playback rate
+  (0.25×–4×); `transpose` shifts the loop's pitch in semitones. Each is
+  independent per slot.
+
+Each lane shows its state (**REC** red while recording/overdubbing, **yellow**
+during count-in or the ending bar), bar count, layer count, and a moving
+playhead. Agents can also **author loops directly** over the text interface
+(`loop1 define 1 C4@0:1 E4@1:1 G4@2:2`) and read their notes back — see below.
 
 ## Text control interface (for agents & scripts)
 
@@ -143,6 +185,10 @@ autochord send <pid> quality min          # switch chord quality
 autochord send <pid> arp on               # turn the arpeggiator on
 autochord send <pid> play C4              # play a chord on middle C
 autochord send <pid> patch Reese Bass     # load a preset (by name or index)
+autochord send <pid> timesig 3/4          # set the bar length loops lock to
+autochord send <pid> loop1 record         # record/stop/overdub loop slot 1
+autochord send <pid> loop2 mute           # mute/solo/undo/reset a loop slot
+autochord send <pid> loop1 define 1 C4@0:1 E4@1:1 G4@2:2   # author a loop directly
 autochord send <pid> subtractive.filter.cutoff 3000   # tweak the synth
 autochord install-skill                   # write the agent skill into ./.claude/skills
 ```
@@ -160,7 +206,8 @@ here** — readable in `state_text`, writable in `apply_command`.
 The voices are a small two-oscillator subtractive synth. **Tab** flips between
 the play view and a synth editor; the piano keys still play in both, so you hear
 edits live. In the editor, **arrow keys** move the cursor through the parameter
-grid and **`-` / `+`** change the selected value (hold to ramp).
+grid and **`-` / `+`** (or `<` / `>`, `,` / `.`) change the selected value
+(hold to ramp).
 
 Signal path: `osc A + osc B + noise → resonant low-pass filter → amp`, in
 stereo (each oscillator can be panned).

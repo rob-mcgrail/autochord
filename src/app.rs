@@ -26,6 +26,170 @@ const BASS_MAX: i32 = 11;
 /// White-key steps the window can be transposed either side of home.
 const WINDOW_RANGE: i32 = 14;
 
+/// Number of loop-recorder slots on the play page (navigable, layered).
+const LOOP_SLOTS: usize = 4;
+/// Selectable time signatures, as beats-per-bar (denominator fixed at /4).
+const TIME_SIGS: [u32; 2] = [4, 3];
+
+/// Per-loop playback-length divisions: the fraction of the recorded loop that
+/// plays before repeating (full, half, quarter, eighth).
+const LOOP_DIVISIONS: [f64; 4] = [1.0, 0.5, 0.25, 0.125];
+const LOOP_DIVISION_LABELS: [&str; 4] = ["1/1", "1/2", "1/4", "1/8"];
+/// Per-loop speed (playback-rate) increment and its step bounds (0.25×–4×).
+const LOOP_SPEED_STEP: f64 = 0.25;
+const LOOP_SPEED_MIN_STEPS: i32 = -3;
+const LOOP_SPEED_MAX_STEPS: i32 = 12;
+/// Per-loop transpose bound in semitones, either direction.
+const LOOP_TRANSPOSE_RANGE: i32 = 24;
+/// Cells in a recorded loop lane: loop, quantize, mute, solo, undo, div, speed,
+/// transpose, reset (columns 0..9).
+const LOOP_CELLS: usize = 9;
+
+/// Per-loop playback quantize grids `(label, grid-in-beats)`. `None` is "free"
+/// — play the notes at their exact recorded timing. Quantize is applied only at
+/// playback (never baked), so switching back to `free` restores the original
+/// feel. Includes straight and triplet grids.
+const LOOP_QUANTIZE: [(&str, Option<f64>); 7] = [
+    ("free", None),
+    ("1/4", Some(1.0)),
+    ("1/8", Some(0.5)),
+    ("1/8T", Some(1.0 / 3.0)),
+    ("1/16", Some(0.25)),
+    ("1/16T", Some(1.0 / 6.0)),
+    ("1/32", Some(0.125)),
+];
+/// Default quantize index (1/16).
+const LOOP_QUANTIZE_DEFAULT: usize = 4;
+
+/// The live keyboard is voice source 0; loop slot `i` is source `i + 1`. See
+/// `synth::Voice::id` for how the source namespaces voices.
+const LIVE_SOURCE: u8 = 0;
+
+/// Compose a synth voice id: high byte = source, low byte = MIDI note.
+fn voice_id(source: u8, note: u8) -> u16 {
+    ((source as u16) << 8) | note as u16
+}
+
+// ---------------------------------------------------------------------------
+// Loop recorder
+// ---------------------------------------------------------------------------
+
+/// One recorded note event, timed in beats from the loop's start.
+#[derive(Clone, Copy)]
+struct LoopEvent {
+    beat: f64,
+    on: bool,
+    note: u8,
+    freq: f32,
+    pan: f32,
+}
+
+/// The lifecycle state of a loop slot. Mute and solo are orthogonal flags.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+enum LoopState {
+    #[default]
+    Empty,
+    /// Record requested; waiting for the next bar line to start capturing.
+    Armed,
+    Recording,
+    Playing,
+}
+
+/// One loop slot: a stack of recorded layers (overdubs) plus playback state.
+/// The first pass sets the loop length (a whole number of bars) and its phase
+/// anchor; later passes overdub onto it. Undo pops the last layer. Phase-locked
+/// to the shared transport so all slots and the arp stay in sync.
+#[derive(Clone)]
+struct LoopSlot {
+    state: LoopState,
+    muted: bool,
+    solo: bool,
+    /// One entry per recorded pass; playback merges them all.
+    layers: Vec<Vec<LoopEvent>>,
+    /// Loop length in beats (a whole number of bars), set by the first pass.
+    len_beats: f64,
+    /// Transport beat the loop is phase-locked to (its beat-0).
+    anchor_beat: f64,
+    /// Loop position (beats) we've fired playback up to, for edge detection.
+    played_to: f64,
+    /// Notes currently sounding from this slot (for clean wrap / mute / clear).
+    sounding: Vec<u8>,
+    /// Playback modifiers (adjusted with `+`/`-` on the lane's cells).
+    quantize_idx: usize, // playback grid the notes snap to (non-destructive)
+    division_idx: usize, // fraction of the loop that plays before repeating
+    speed_steps: i32,    // playback-rate increments from 1×
+    transpose: i32,      // semitone shift applied to played notes
+}
+
+impl Default for LoopSlot {
+    fn default() -> Self {
+        Self {
+            state: LoopState::default(),
+            muted: false,
+            solo: false,
+            layers: Vec::new(),
+            len_beats: 0.0,
+            anchor_beat: 0.0,
+            played_to: 0.0,
+            sounding: Vec::new(),
+            quantize_idx: LOOP_QUANTIZE_DEFAULT,
+            division_idx: 0,
+            speed_steps: 0,
+            transpose: 0,
+        }
+    }
+}
+
+impl LoopSlot {
+    fn has_content(&self) -> bool {
+        !self.layers.is_empty()
+    }
+
+    /// Playback quantize grid in beats, or `None` for free (as recorded).
+    fn quantize_grid(&self) -> Option<f64> {
+        LOOP_QUANTIZE[self.quantize_idx.min(LOOP_QUANTIZE.len() - 1)].1
+    }
+
+    fn quantize_label(&self) -> &'static str {
+        LOOP_QUANTIZE[self.quantize_idx.min(LOOP_QUANTIZE.len() - 1)].0
+    }
+
+    /// Fraction of the recorded loop that plays before repeating.
+    fn division(&self) -> f64 {
+        LOOP_DIVISIONS[self.division_idx.min(LOOP_DIVISIONS.len() - 1)]
+    }
+
+    fn division_label(&self) -> &'static str {
+        LOOP_DIVISION_LABELS[self.division_idx.min(LOOP_DIVISION_LABELS.len() - 1)]
+    }
+
+    /// Playback-rate multiplier (1× is nominal, phase-locked to the transport).
+    fn speed(&self) -> f64 {
+        1.0 + self.speed_steps as f64 * LOOP_SPEED_STEP
+    }
+
+    /// Effective loop length in beats after the division.
+    fn span(&self) -> f64 {
+        self.len_beats * self.division()
+    }
+}
+
+/// An in-progress recording pass.
+struct Recording {
+    slot: usize,
+    /// The loop-defining first pass (bar-aligned start/stop) vs an overdub
+    /// (records straight onto the already-cycling loop).
+    defining: bool,
+    /// Bar-aligned start (defining pass only).
+    start_beat: f64,
+    /// Bar-aligned stop, set on the second Space (defining pass only).
+    stop_beat: Option<f64>,
+    events: Vec<LoopEvent>,
+    /// Pending count-in clicks `(beat, accent)`, drained as the transport
+    /// reaches them (first-ever recording only). Accent marks the downbeat.
+    count_in: Vec<(f64, bool)>,
+}
+
 /// Ignore repeated presses of the same chord button within this window, so OS
 /// key-repeat can't rapidly flip a latch on and off.
 const BUTTON_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -520,7 +684,20 @@ pub struct App {
     arp_len: usize,
     /// Triplet feel (`5`): 16th-triplet grid instead of straight 16ths.
     arp_triplet: bool,
-    /// Shared clock: tempo + beat grid, synced across instances (↑/↓ set it).
+    /// Time-signature numerator (beats per bar; denominator fixed at /4). Sets
+    /// the bar length the loop recorder locks to. One of `TIME_SIGS`.
+    beats_per_bar: u32,
+    /// Play-page selection grid. Row 0 is the transport (Tempo · Time · Keys);
+    /// rows 1..=LOOP_SLOTS are the loop lanes. `sel_col` indexes cells within
+    /// the row. Arrows move it; `+`/`-` adjust the transport row; Space presses
+    /// the selected loop button.
+    sel_row: usize,
+    sel_col: usize,
+    /// The four loop slots (baked note-tapes, layered, phase-locked).
+    loops: [LoopSlot; LOOP_SLOTS],
+    /// The recording pass in progress, if any (only one at a time).
+    rec: Option<Recording>,
+    /// Shared clock: tempo + beat grid, synced across instances.
     transport: Transport,
     /// Arpeggiator runtime: pattern position, the note currently sounding, and
     /// the last global grid step we fired on. `rng` seeds the Random pattern.
@@ -528,9 +705,10 @@ pub struct App {
     arp_sounding: Option<u8>,
     last_step: i64,
     rng: u32,
-    /// MIDI notes we've sent NoteOn for and not yet NoteOff'd — lets us silence
-    /// cleanly when switching chords or arp mode.
-    sent: Vec<u8>,
+    /// Live notes we've sent NoteOn for and not yet NoteOff'd, as
+    /// `(note, freq, pan)` — lets us silence cleanly when switching chords or
+    /// arp mode, and snapshot what's sounding into a starting recording.
+    sent: Vec<(u8, f32, f32)>,
     /// The synth patch *target* — what the editor, presets, and text commands
     /// set, and what `state_text` reports. The sounding patch (`patch_live`)
     /// glides toward this over a beat, so switches don't jump.
@@ -602,6 +780,11 @@ impl App {
             arp_pattern: ArpPattern::Up,
             arp_len: ARP_LEN_DEFAULT,
             arp_triplet: false,
+            beats_per_bar: TIME_SIGS[0],
+            sel_row: 0,
+            sel_col: 0,
+            loops: std::array::from_fn(|_| LoopSlot::default()),
+            rec: None,
             transport,
             arp_pos: 0,
             arp_sounding: None,
@@ -682,21 +865,17 @@ impl App {
         }
     }
 
-    /// Play-view controls: tempo, latch, lock, dials, transpose, chords, arp.
+    /// Play-view controls: grid navigation, loop buttons, latch, lock, dials,
+    /// chords, arp.
     fn play_key(&mut self, key: KeyEvent, c: Option<char>) {
-        // Global tempo: up/down arrows (shared across instances via transport).
+        // Arrows walk the selection grid: row 0 is the transport (Tempo · Time ·
+        // Keys); rows below are the loop lanes and their action buttons.
         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             match key.code {
-                KeyCode::Up => {
-                    let t = (self.transport.tempo() + 5).min(TEMPO_MAX);
-                    self.transport.set_tempo(t);
-                    return;
-                }
-                KeyCode::Down => {
-                    let t = self.transport.tempo().saturating_sub(5).max(TEMPO_MIN);
-                    self.transport.set_tempo(t);
-                    return;
-                }
+                KeyCode::Left => return self.move_sel(0, -1),
+                KeyCode::Right => return self.move_sel(0, 1),
+                KeyCode::Up => return self.move_sel(-1, 0),
+                KeyCode::Down => return self.move_sel(1, 0),
                 _ => {}
             }
         }
@@ -704,6 +883,15 @@ impl App {
         let Some(c) = c else {
             return;
         };
+
+        // Space: press the selected loop button (record/overdub, mute, solo,
+        // undo, reset). Debounced so key-repeat doesn't double-fire.
+        if c == ' ' {
+            if key.kind == KeyEventKind::Press && self.button_debounced(' ') {
+                self.press_loop_button();
+            }
+            return;
+        }
 
         // `/`: toggle the arpeggiator.
         if c == '/' {
@@ -755,19 +943,21 @@ impl App {
             return;
         }
 
-        // Voicing dials. Act on press AND repeat so holding a key sweeps the
-        // voicing continuously, like turning a knob.
-        if matches!(c, '-' | '=' | '+' | '[' | ']') {
+        // Voicing (`;`/`'`) and bass (`[`/`]`) dials. Act on press AND repeat so
+        // holding a key sweeps continuously, like turning a knob.
+        if matches!(c, ';' | '\'' | '[' | ']') {
             if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 self.turn_dial(c);
             }
             return;
         }
 
-        // Transpose the whole keyboard a semitone (accept shifted or not).
-        if matches!(c, '<' | ',' | '>' | '.') {
+        // Adjust the selected field: `-`/`<`/`,` down, `=`/`+`/`>`/`.` up. Act on
+        // press AND repeat so holding sweeps (e.g. tempo, transpose).
+        if matches!(c, '-' | '<' | ',' | '=' | '+' | '>' | '.') {
             if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                self.transpose_by(if matches!(c, '<' | ',') { -1 } else { 1 });
+                let dir = if matches!(c, '-' | '<' | ',') { -1 } else { 1 };
+                self.adjust_field(dir);
             }
             return;
         }
@@ -782,7 +972,8 @@ impl App {
         }
     }
 
-    /// Synth-view controls: arrows navigate the parameter grid, `-`/`+` adjust.
+    /// Synth-view controls: arrows navigate the parameter grid, `-`/`+` adjust
+    /// (with `<`/`,` and `>`/`.` as equivalents, matching the play panel).
     fn synth_key(&mut self, key: KeyEvent, c: Option<char>) {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return;
@@ -795,8 +986,8 @@ impl App {
             _ => {}
         }
         match c {
-            Some('-') => self.synth_adjust(-1),
-            Some('+') | Some('=') => self.synth_adjust(1),
+            Some('-') | Some('<') | Some(',') => self.synth_adjust(-1),
+            Some('+') | Some('=') | Some('>') | Some('.') => self.synth_adjust(1),
             _ => {}
         }
     }
@@ -942,10 +1133,148 @@ impl App {
         }
     }
 
-    /// Slide the window `delta` white keys along the piano. A physically-held
-    /// key re-pitches to its note at the new window (Kitty); a chord only
-    /// ringing via latch, or anything in fallback, stays put. If the held key
-    /// lands where there's no note (a black-key gap), it goes quiet.
+    /// Number of selectable cells in play-page row `row` (0 = transport;
+    /// 1..=LOOP_SLOTS = loop lanes, whose cells appear once recorded).
+    fn row_width(&self, row: usize) -> usize {
+        if row == 0 {
+            3 // tempo, time-sig, keyboard
+        } else if self.loops[row - 1].has_content() {
+            LOOP_CELLS // loop, mute, solo, undo, div, speed, xpose, reset
+        } else {
+            1 // just the (empty) loop cell
+        }
+    }
+
+    /// Move the selection in the play-page grid, clamped; clamp the column to
+    /// the destination row's width.
+    fn move_sel(&mut self, drow: i32, dcol: i32) {
+        let rows = 1 + LOOP_SLOTS as i32; // transport + loop lanes
+        self.sel_row = (self.sel_row as i32 + drow).clamp(0, rows - 1) as usize;
+        let w = self.row_width(self.sel_row) as i32;
+        self.sel_col = (self.sel_col as i32 + dcol).clamp(0, w - 1) as usize;
+        // Landing on a new row via up/down can leave the column past its end.
+        self.sel_col = self.sel_col.min(w as usize - 1);
+    }
+
+    /// Adjust the selected field by `dir` (±1): the transport row's tempo /
+    /// time-sig / keyboard, or a loop lane's division / speed / transpose.
+    fn adjust_field(&mut self, dir: i32) {
+        if self.sel_row == 0 {
+            match self.sel_col {
+                0 => {
+                    // Tempo, ±1 BPM (shared across instances via the transport).
+                    let t = (self.transport.tempo() as i32 + dir)
+                        .clamp(TEMPO_MIN as i32, TEMPO_MAX as i32) as u32;
+                    self.transport.set_tempo(t);
+                }
+                1 => self.cycle_time_sig(dir),
+                2 => self.transpose_by(dir),
+                _ => {}
+            }
+            return;
+        }
+        // A loop lane: quantize (1), div (5), speed (6), transpose (7) are
+        // +/- controlled; the rest are Space buttons.
+        let slot = self.sel_row - 1;
+        if !self.loops[slot].has_content() {
+            return;
+        }
+        match self.sel_col {
+            1 => {
+                let n = LOOP_QUANTIZE.len() as i32;
+                self.loops[slot].quantize_idx =
+                    (self.loops[slot].quantize_idx as i32 + dir).clamp(0, n - 1) as usize;
+                // No resync: quantize is applied per-event at playback.
+            }
+            5 => {
+                let n = LOOP_DIVISIONS.len() as i32;
+                self.loops[slot].division_idx =
+                    (self.loops[slot].division_idx as i32 + dir).clamp(0, n - 1) as usize;
+                self.resync_slot(slot);
+            }
+            6 => {
+                self.loops[slot].speed_steps = (self.loops[slot].speed_steps + dir)
+                    .clamp(LOOP_SPEED_MIN_STEPS, LOOP_SPEED_MAX_STEPS);
+                self.resync_slot(slot);
+            }
+            7 => {
+                self.loops[slot].transpose = (self.loops[slot].transpose + dir)
+                    .clamp(-LOOP_TRANSPOSE_RANGE, LOOP_TRANSPOSE_RANGE);
+                self.resync_slot(slot);
+            }
+            _ => {}
+        }
+    }
+
+    /// Re-align a slot's playback after a division/speed/transpose change:
+    /// silence its notes and reset the play cursor to the current position so
+    /// the change doesn't burst events or hang notes.
+    fn resync_slot(&mut self, slot: usize) {
+        self.force_off_slot(slot);
+        let now = self.now_beats();
+        let s = &self.loops[slot];
+        let span = s.span();
+        self.loops[slot].played_to = if span > 0.0 {
+            ((now - s.anchor_beat) * s.speed()).rem_euclid(span)
+        } else {
+            0.0
+        };
+    }
+
+    /// Cycle the time signature through `TIME_SIGS` by `dir`.
+    fn cycle_time_sig(&mut self, dir: i32) {
+        let i = TIME_SIGS
+            .iter()
+            .position(|&b| b == self.beats_per_bar)
+            .unwrap_or(0) as i32;
+        let n = TIME_SIGS.len() as i32;
+        self.beats_per_bar = TIME_SIGS[(i + dir).rem_euclid(n) as usize];
+    }
+
+    /// The stable name of the currently-selected cell (for the `field` state
+    /// key): `tempo`/`timesig`/`keyboard`, or `loopN[.button]`.
+    fn selected_field_name(&self) -> String {
+        match self.sel_row {
+            0 => ["tempo", "timesig", "keyboard"][self.sel_col.min(2)].to_string(),
+            r => {
+                let btn = ["", ".quantize", ".mute", ".solo", ".undo", ".div", ".speed",
+                    ".transpose", ".reset"][self.sel_col.min(LOOP_CELLS - 1)];
+                format!("loop{}{}", r, btn)
+            }
+        }
+    }
+
+    /// Point the selection at a named transport field or loop cell.
+    fn select_field(&mut self, name: &str) {
+        match name {
+            "tempo" => (self.sel_row, self.sel_col) = (0, 0),
+            "timesig" => (self.sel_row, self.sel_col) = (0, 1),
+            "keyboard" => (self.sel_row, self.sel_col) = (0, 2),
+            _ => {
+                if let Some(rest) = name.strip_prefix("loop") {
+                    let mut it = rest.splitn(2, '.');
+                    if let Some(n) = it.next().and_then(|s| s.parse::<usize>().ok()) {
+                        if (1..=LOOP_SLOTS).contains(&n) {
+                            let col = match it.next() {
+                                Some("quantize") => 1,
+                                Some("mute") => 2,
+                                Some("solo") => 3,
+                                Some("undo") => 4,
+                                Some("div") => 5,
+                                Some("speed") => 6,
+                                Some("transpose") => 7,
+                                Some("reset") => 8,
+                                _ => 0,
+                            };
+                            self.sel_row = n;
+                            self.sel_col = col.min(self.row_width(n) - 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn transpose_by(&mut self, delta: i32) {
         self.window = (self.window + delta).clamp(-WINDOW_RANGE, WINDOW_RANGE);
         if self.enhanced {
@@ -1070,9 +1399,9 @@ impl App {
     /// Turn one of the voicing dials, then re-voice any sounding chord.
     fn turn_dial(&mut self, c: char) {
         match c {
-            // Chord Voicing: - lowers (highest note down), + raises (lowest up).
-            '-' => self.voicing = (self.voicing - 1).max(-VOICING_RANGE),
-            '=' | '+' => self.voicing = (self.voicing + 1).min(VOICING_RANGE),
+            // Chord Voicing: ; lowers (highest note down), ' raises (lowest up).
+            ';' => self.voicing = (self.voicing - 1).max(-VOICING_RANGE),
+            '\'' => self.voicing = (self.voicing + 1).min(VOICING_RANGE),
             // Bass: ] engages/raises, [ lowers and switches off below the root.
             ']' => {
                 self.bass = Some(match self.bass {
@@ -1147,23 +1476,25 @@ impl App {
         for (i, &id) in notes.iter().enumerate() {
             let freq = tone_frequency(root, id, self.just);
             let pan = self.spread_pan(i, count);
-            let _ = self.tx.send(SynthEvent::NoteOn { id, freq, pan });
+            let _ = self.tx.send(SynthEvent::NoteOn { id: voice_id(LIVE_SOURCE, id), freq, pan });
         }
     }
 
-    /// Note-off everything currently sounding.
+    /// Note-off everything the live keyboard is sounding.
     fn silence(&mut self) {
-        for id in std::mem::take(&mut self.sent) {
-            let _ = self.tx.send(SynthEvent::NoteOff { id });
+        for (id, _, _) in std::mem::take(&mut self.sent) {
+            let _ = self.tx.send(SynthEvent::NoteOff { id: voice_id(LIVE_SOURCE, id) });
+            self.capture(id, false, 0.0, 0.0);
         }
     }
 
     /// Start tone `id`, tuned relative to `root`, panned by `pan` (stereo spread).
     fn send_on(&mut self, root: u8, id: u8, pan: f32) {
-        if !self.sent.contains(&id) {
+        if !self.sent.iter().any(|&(n, _, _)| n == id) {
             let freq = tone_frequency(root, id, self.just);
-            let _ = self.tx.send(SynthEvent::NoteOn { id, freq, pan });
-            self.sent.push(id);
+            let _ = self.tx.send(SynthEvent::NoteOn { id: voice_id(LIVE_SOURCE, id), freq, pan });
+            self.sent.push((id, freq, pan));
+            self.capture(id, true, freq, pan);
         }
     }
 
@@ -1179,9 +1510,327 @@ impl App {
     }
 
     fn send_off(&mut self, id: u8) {
-        if let Some(pos) = self.sent.iter().position(|&n| n == id) {
+        if let Some(pos) = self.sent.iter().position(|&(n, _, _)| n == id) {
             self.sent.remove(pos);
-            let _ = self.tx.send(SynthEvent::NoteOff { id });
+            let _ = self.tx.send(SynthEvent::NoteOff { id: voice_id(LIVE_SOURCE, id) });
+            self.capture(id, false, 0.0, 0.0);
+        }
+    }
+
+    /// Write the notes the live keyboard is currently sounding into the running
+    /// recording as note-ons, so a chord or arp already latched when recording
+    /// begins is captured too (not only changes made inside the window).
+    fn snapshot_live(&mut self) {
+        for (note, freq, pan) in self.sent.clone() {
+            self.capture(note, true, freq, pan);
+        }
+    }
+
+    // --- Loop recorder ------------------------------------------------------
+
+    /// Transport position in beats since the shared epoch.
+    fn now_beats(&self) -> f64 {
+        self.transport.step_position(1)
+    }
+
+    /// Bar length in beats (the time-signature numerator).
+    fn bar_beats(&self) -> f64 {
+        self.beats_per_bar as f64
+    }
+
+    /// The next bar downbeat at or after `from` (strictly after, so a fresh
+    /// bar always follows).
+    fn next_bar(&self, from: f64) -> f64 {
+        let b = self.bar_beats();
+        (from / b).floor() * b + b
+    }
+
+    /// If a recording is running, append this live note event to it, timed to
+    /// the loop. Called from `send_on`/`send_off`/`silence`, so a loop captures
+    /// exactly the notes that sounded — chords, arps, voicing/bass/addition
+    /// changes and all — baked in.
+    fn capture(&mut self, note: u8, on: bool, freq: f32, pan: f32) {
+        if self.rec.is_none() {
+            return;
+        }
+        let now = self.now_beats();
+        let (slot, defining, start) = {
+            let r = self.rec.as_ref().unwrap();
+            (r.slot, r.defining, r.start_beat)
+        };
+        let beat = if defining {
+            if now < start {
+                return; // still armed — capture only once past the bar line
+            }
+            now - start
+        } else {
+            let s = &self.loops[slot];
+            (now - s.anchor_beat).rem_euclid(s.len_beats)
+        };
+        self.rec
+            .as_mut()
+            .unwrap()
+            .events
+            .push(LoopEvent { beat, on, note, freq, pan });
+    }
+
+    /// Space on the selected grid cell.
+    fn press_loop_button(&mut self) {
+        if self.sel_row == 0 {
+            return; // transport row — Space does nothing
+        }
+        let slot = self.sel_row - 1;
+        self.sel_col = self.sel_col.min(self.row_width(self.sel_row) - 1);
+        match self.sel_col {
+            0 => self.loop_record_button(slot),
+            2 => self.loops[slot].muted = !self.loops[slot].muted,
+            3 => self.loops[slot].solo = !self.loops[slot].solo,
+            4 => self.loop_undo(slot),
+            8 => self.loop_reset(slot),
+            // 1 quantize, 5 div, 6 speed, 7 transpose are +/- controlled.
+            _ => {}
+        }
+    }
+
+    /// The loop cell (col 0): start recording, stop the pass, or start an
+    /// overdub — depending on what's happening for this slot.
+    fn loop_record_button(&mut self, slot: usize) {
+        match &self.rec {
+            Some(r) if r.slot == slot => self.stop_recording(),
+            Some(_) => {} // another slot is recording — ignore
+            None => self.start_recording(slot),
+        }
+    }
+
+    fn start_recording(&mut self, slot: usize) {
+        let now = self.now_beats();
+        if self.loops[slot].has_content() {
+            // Overdub straight onto the cycling loop (no bar wait); make sure
+            // it's audible so you hear what you're layering over.
+            self.loops[slot].muted = false;
+            self.rec = Some(Recording {
+                slot,
+                defining: false,
+                start_beat: 0.0,
+                stop_beat: None,
+                events: Vec::new(),
+                count_in: Vec::new(),
+            });
+            self.snapshot_live(); // capture any chord/arp already held
+        } else {
+            // Loop-defining pass: arm and start on the next bar line. When it's
+            // the first-ever loop (nothing else to play against), give a full
+            // bar of quarter-note count-in clicks leading in.
+            let bar = self.bar_beats();
+            let first_ever = !self.loops.iter().any(|s| s.has_content());
+            let mut start = self.next_bar(now);
+            if first_ever && start - now < bar {
+                start += bar; // ensure a full, clean count-in bar before start
+            }
+            let count_in = if first_ever {
+                (0..self.beats_per_bar)
+                    .map(|k| (start - bar + k as f64, k == 0))
+                    .filter(|&(b, _)| b >= now)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            self.rec = Some(Recording {
+                slot,
+                defining: true,
+                start_beat: start,
+                stop_beat: None,
+                events: Vec::new(),
+                count_in,
+            });
+            self.loops[slot].state = LoopState::Armed;
+        }
+    }
+
+    /// Second Space on the recording slot: for the defining pass, mark a
+    /// bar-aligned stop (finalised in `tick`); for an overdub, commit now.
+    fn stop_recording(&mut self) {
+        let Some(rec) = self.rec.as_ref() else { return };
+        let slot = rec.slot;
+        if rec.defining {
+            let now = self.now_beats();
+            let stop = self.next_bar(now).max(rec.start_beat + self.bar_beats());
+            self.rec.as_mut().unwrap().stop_beat = Some(stop);
+        } else {
+            let events = self.rec.take().unwrap().events;
+            if !events.is_empty() {
+                self.loops[slot].layers.push(events);
+            }
+        }
+    }
+
+    /// Finalise a defining pass once the transport reaches its stop bar.
+    fn finalize_defining(&mut self) {
+        let rec = self.rec.take().unwrap();
+        let len = rec.stop_beat.unwrap() - rec.start_beat;
+        let s = &mut self.loops[rec.slot];
+        s.layers = vec![rec.events];
+        s.len_beats = len;
+        s.anchor_beat = rec.start_beat;
+        s.played_to = 0.0;
+        s.state = LoopState::Playing;
+    }
+
+    /// Undo (pop) the most recent layer of a slot; empties the slot if it was
+    /// the only one. Ignored while that slot is recording.
+    fn loop_undo(&mut self, slot: usize) {
+        if matches!(&self.rec, Some(r) if r.slot == slot) {
+            return;
+        }
+        self.force_off_slot(slot);
+        self.loops[slot].layers.pop();
+        if self.loops[slot].layers.is_empty() {
+            self.loops[slot] = LoopSlot::default();
+        }
+        self.clamp_sel();
+    }
+
+    /// Reset a slot completely back to empty.
+    fn loop_reset(&mut self, slot: usize) {
+        if matches!(&self.rec, Some(r) if r.slot == slot) {
+            self.rec = None;
+        }
+        self.force_off_slot(slot);
+        self.loops[slot] = LoopSlot::default();
+        self.clamp_sel();
+    }
+
+    /// Clamp the selected column into the current row's width (state changes can
+    /// shrink a row from under a stationary cursor).
+    fn clamp_sel(&mut self) {
+        let w = self.row_width(self.sel_row);
+        self.sel_col = self.sel_col.min(w - 1);
+    }
+
+    /// Advance recording state and all loop playback. Called every frame.
+    fn tick_loops(&mut self) {
+        let now = self.now_beats();
+        // Count-in: fire any clicks the transport has reached.
+        if let Some(rec) = self.rec.as_mut() {
+            while rec.count_in.first().is_some_and(|&(b, _)| now >= b) {
+                let (_, accent) = rec.count_in.remove(0);
+                let _ = self.tx.send(SynthEvent::Click { accent });
+            }
+        }
+        // Recording state transitions (defining pass only).
+        if let Some((slot, start, stop)) = self
+            .rec
+            .as_ref()
+            .filter(|r| r.defining)
+            .map(|r| (r.slot, r.start_beat, r.stop_beat))
+        {
+            if self.loops[slot].state == LoopState::Armed && now >= start {
+                self.loops[slot].state = LoopState::Recording;
+                self.snapshot_live(); // bake in a chord/arp already sounding
+            }
+            if stop.is_some_and(|s| now >= s) {
+                self.finalize_defining();
+            }
+        }
+        // Playback. Solo wins: if any slot is soloed, only soloed slots sound.
+        let any_solo = self.loops.iter().any(|s| s.solo && s.has_content());
+        for i in 0..LOOP_SLOTS {
+            self.play_loop_slot(i, now, any_solo);
+        }
+    }
+
+    /// Fire a slot's recorded events for the beats crossed this frame. Position
+    /// respects the loop's division (effective length) and speed; only events
+    /// within the effective span play, so a shortened loop repeats sooner.
+    fn play_loop_slot(&mut self, i: usize, now: f64, any_solo: bool) {
+        let s = &self.loops[i];
+        let span = s.span();
+        if s.state != LoopState::Playing || !s.has_content() || span <= 0.0 {
+            return;
+        }
+        let audible = !s.muted && (!any_solo || s.solo);
+        let pos = ((now - s.anchor_beat) * s.speed()).rem_euclid(span);
+        let from = s.played_to;
+
+        if !audible {
+            if !self.loops[i].sounding.is_empty() {
+                self.force_off_slot(i);
+            }
+            self.loops[i].played_to = pos;
+            return;
+        }
+
+        if pos >= from {
+            self.fire_range(i, from, pos, true);
+        } else {
+            // Wrapped the loop: finish the tail, silence at the boundary for a
+            // clean restart, then play the new cycle's head.
+            self.fire_range(i, from, span, false);
+            self.force_off_slot(i);
+            self.fire_range(i, 0.0, pos, true);
+        }
+        self.loops[i].played_to = pos;
+    }
+
+    /// Fire slot `i`'s events with beat in `(lo, hi]` (or `[0, hi]` at the head
+    /// of a cycle when `inclusive_lo`), in time order.
+    fn fire_range(&mut self, i: usize, lo: f64, hi: f64, inclusive_lo: bool) {
+        // Quantize is applied here, at playback — the stored beats stay exact,
+        // so switching back to "free" restores the original timing.
+        let grid = self.loops[i].quantize_grid();
+        let q = |b: f64| match grid {
+            Some(g) => (b / g).round() * g,
+            None => b,
+        };
+        let mut fired: Vec<(f64, LoopEvent)> = Vec::new();
+        for layer in &self.loops[i].layers {
+            for &e in layer {
+                let beat = q(e.beat);
+                let after = if inclusive_lo && lo == 0.0 {
+                    beat >= lo
+                } else {
+                    beat > lo
+                };
+                if after && beat <= hi {
+                    fired.push((beat, e));
+                }
+            }
+        }
+        fired.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        for (_, e) in fired {
+            if e.on {
+                self.send_loop_on(i, e);
+            } else {
+                self.send_loop_off(i, e.note);
+            }
+        }
+    }
+
+    fn send_loop_on(&mut self, i: usize, e: LoopEvent) {
+        let t = self.loops[i].transpose;
+        let note = (e.note as i32 + t).clamp(0, 127) as u8;
+        let freq = e.freq * 2f32.powf(t as f32 / 12.0);
+        let id = voice_id(i as u8 + 1, note);
+        let _ = self.tx.send(SynthEvent::NoteOn { id, freq, pan: e.pan });
+        if !self.loops[i].sounding.contains(&note) {
+            self.loops[i].sounding.push(note);
+        }
+    }
+
+    fn send_loop_off(&mut self, i: usize, note: u8) {
+        // Match the shift used when the note was started (see `send_loop_on`).
+        let t = self.loops[i].transpose;
+        let note = (note as i32 + t).clamp(0, 127) as u8;
+        if let Some(pos) = self.loops[i].sounding.iter().position(|&n| n == note) {
+            self.loops[i].sounding.remove(pos);
+            let _ = self.tx.send(SynthEvent::NoteOff { id: voice_id(i as u8 + 1, note) });
+        }
+    }
+
+    /// Silence every note a slot currently has sounding.
+    fn force_off_slot(&mut self, i: usize) {
+        for note in std::mem::take(&mut self.loops[i].sounding) {
+            let _ = self.tx.send(SynthEvent::NoteOff { id: voice_id(i as u8 + 1, note) });
         }
     }
 
@@ -1248,6 +1897,7 @@ impl App {
     pub fn tick(&mut self) {
         self.transport.sync(); // pick up tempo/epoch changes from other instances
         self.update_patch_glide(); // ease the sounding patch toward its target
+        self.tick_loops(); // advance loop recording/playback
 
         // Fallback lead/bass: release the brief one-shot note when its gate lapses.
         if let Some(t) = self.lead_off {
@@ -1370,12 +2020,57 @@ impl App {
         let _ = writeln!(s, "pattern {}", self.arp_pattern.label());
         let _ = writeln!(s, "phrase {}", self.arp_length());
         let _ = writeln!(s, "triplet {}", onoff(self.arp_triplet));
+        let _ = writeln!(s, "timesig {}/4", self.beats_per_bar);
+        let _ = writeln!(s, "field {}", self.selected_field_name());
         let _ = writeln!(s, "chord {}", {
             let name = chord_description(self);
             if name.is_empty() { "-".to_string() } else { name }
         });
         let notes: Vec<String> = self.active_notes().iter().map(|&n| note_name(n)).collect();
         let _ = writeln!(s, "notes {}", if notes.is_empty() { "-".into() } else { notes.join(" ") });
+        // Loop slots: `loopN state bars layers [div .. speed .. transpose ..]
+        // [muted] [solo]`.
+        for (i, slot) in self.loops.iter().enumerate() {
+            let bars = if slot.len_beats > 0.0 {
+                (slot.len_beats / self.bar_beats()).round() as u32
+            } else {
+                0
+            };
+            let mut line = format!(
+                "loop{} {} {}bars {}layers",
+                i + 1,
+                loop_state_name(slot.state),
+                bars,
+                slot.layers.len()
+            );
+            if slot.has_content() {
+                let _ = write!(
+                    line,
+                    " quantize {} div {} speed {:.2}x transpose {}",
+                    slot.quantize_label(),
+                    slot.division_label(),
+                    slot.speed(),
+                    slot.transpose
+                );
+            }
+            if slot.muted {
+                line.push_str(" muted");
+            }
+            if slot.solo {
+                line.push_str(" solo");
+            }
+            let _ = writeln!(s, "{line}");
+            // Each layer's notes as `note@beat:dur`, mirroring the write format.
+            for (k, layer) in slot.layers.iter().enumerate() {
+                let _ = writeln!(
+                    s,
+                    "loop{}.layer{} {}",
+                    i + 1,
+                    k + 1,
+                    self.layer_tokens(layer, slot.len_beats)
+                );
+            }
+        }
         // Selected preset (PgUp/PgDn or the `patch` command).
         let presets = crate::synth::presets();
         let pi = self.patch_index.min(presets.len() - 1);
@@ -1473,6 +2168,16 @@ impl App {
                 self.last_step = self.arp_note_step();
                 self.sync_working();
             }
+            "timesig" => {
+                // Accept "4/4" or bare "4"; snap to a supported signature.
+                let beats: Option<u32> = arg.split('/').next().and_then(|n| n.parse().ok());
+                if let Some(b) = beats {
+                    if TIME_SIGS.contains(&b) {
+                        self.beats_per_bar = b;
+                    }
+                }
+            }
+            "field" => self.select_field(arg),
             "play" => {
                 if let Some(root) = parse_note(arg) {
                     self.current_locked = false;
@@ -1494,13 +2199,170 @@ impl App {
                 }
             }
             other => {
-                if let Some(p) = param_by_key(other) {
+                if let Some(slot) =
+                    other.strip_prefix("loop").and_then(|n| n.parse::<usize>().ok())
+                {
+                    if (1..=LOOP_SLOTS).contains(&slot) {
+                        match arg {
+                            "quantize" | "quant" | "div" | "division" | "speed" | "transpose" => {
+                                self.loop_set(slot - 1, arg, rest.get(1).copied().unwrap_or(""));
+                            }
+                            "define" => self.loop_define(slot - 1, &rest[1..]),
+                            "layer" => self.loop_layer(slot - 1, &rest[1..]),
+                            _ => self.loop_command(slot - 1, arg),
+                        }
+                    }
+                } else if let Some(p) = param_by_key(other) {
                     if p.set_raw(&mut self.patch, arg) {
                         self.retarget_patch();
                     }
                 }
             }
         }
+    }
+
+    /// A loop action from the text interface: `loopN <action>`.
+    fn loop_command(&mut self, slot: usize, action: &str) {
+        match action {
+            "record" | "rec" | "overdub" | "press" | "toggle" | "" => {
+                self.loop_record_button(slot)
+            }
+            "stop" => {
+                if matches!(&self.rec, Some(r) if r.slot == slot) {
+                    self.stop_recording();
+                }
+            }
+            "mute" => self.loops[slot].muted = true,
+            "unmute" => self.loops[slot].muted = false,
+            "solo" => self.loops[slot].solo = true,
+            "unsolo" => self.loops[slot].solo = false,
+            "undo" => self.loop_undo(slot),
+            "reset" | "clear" => self.loop_reset(slot),
+            _ => {}
+        }
+    }
+
+    /// A loop playback-modifier from the text interface: `loopN <field> <value>`
+    /// where field is `div`/`speed`/`transpose`.
+    fn loop_set(&mut self, slot: usize, field: &str, value: &str) {
+        match field {
+            "quantize" | "quant" => {
+                if let Some(i) = LOOP_QUANTIZE.iter().position(|&(l, _)| l == value) {
+                    self.loops[slot].quantize_idx = i;
+                }
+            }
+            "div" | "division" => {
+                if let Some(i) = LOOP_DIVISION_LABELS.iter().position(|&l| l == value) {
+                    self.loops[slot].division_idx = i;
+                    self.resync_slot(slot);
+                }
+            }
+            "speed" => {
+                if let Ok(mult) = value.trim_end_matches('x').parse::<f64>() {
+                    let steps = ((mult - 1.0) / LOOP_SPEED_STEP).round() as i32;
+                    self.loops[slot].speed_steps =
+                        steps.clamp(LOOP_SPEED_MIN_STEPS, LOOP_SPEED_MAX_STEPS);
+                    self.resync_slot(slot);
+                }
+            }
+            "transpose" => {
+                if let Ok(t) = value.parse::<i32>() {
+                    self.loops[slot].transpose = t.clamp(-LOOP_TRANSPOSE_RANGE, LOOP_TRANSPOSE_RANGE);
+                    self.resync_slot(slot);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Author a loop directly (for agents/scripts): `loopN define <bars>
+    /// <note@beat:dur> ...`. Replaces the slot with one baked layer, `bars`
+    /// bars long, phase-locked to the current bar. Defaults to `free` quantize
+    /// so the supplied timing plays exactly.
+    fn loop_define(&mut self, slot: usize, args: &[&str]) {
+        let Some(bars) = args.first().and_then(|s| s.parse::<u32>().ok()) else {
+            return;
+        };
+        if bars == 0 {
+            return;
+        }
+        let len = bars as f64 * self.bar_beats();
+        let events = self.parse_loop_events(&args[1..], len);
+        let now = self.now_beats();
+        let bar = self.bar_beats();
+        let anchor = (now / bar).floor() * bar; // most recent bar line
+        self.force_off_slot(slot);
+        self.loops[slot] = LoopSlot {
+            state: LoopState::Playing,
+            layers: vec![events],
+            len_beats: len,
+            anchor_beat: anchor,
+            played_to: (now - anchor).rem_euclid(len),
+            quantize_idx: 0, // agent supplies exact timing → free
+            ..LoopSlot::default()
+        };
+        self.clamp_sel();
+    }
+
+    /// Overdub an authored layer onto an existing loop: `loopN layer
+    /// <note@beat:dur> ...` (beats within the loop's existing length).
+    fn loop_layer(&mut self, slot: usize, args: &[&str]) {
+        if !self.loops[slot].has_content() {
+            return;
+        }
+        let len = self.loops[slot].len_beats;
+        let events = self.parse_loop_events(args, len);
+        if !events.is_empty() {
+            self.loops[slot].layers.push(events);
+        }
+    }
+
+    /// Parse `note@beat:dur` tokens into on/off loop events (beats wrapped into
+    /// `len`). `note` may be a name (`C4`, `F#3`) or raw MIDI number.
+    fn parse_loop_events(&self, tokens: &[&str], len: f64) -> Vec<LoopEvent> {
+        let mut events = Vec::new();
+        for tok in tokens {
+            let Some((note_s, rest)) = tok.split_once('@') else {
+                continue;
+            };
+            let Some((beat_s, dur_s)) = rest.split_once(':') else {
+                continue;
+            };
+            let (Some(note), Ok(beat), Ok(dur)) = (
+                parse_note(note_s),
+                beat_s.parse::<f64>(),
+                dur_s.parse::<f64>(),
+            ) else {
+                continue;
+            };
+            let beat = beat.rem_euclid(len);
+            let freq = tone_frequency(note, note, self.just);
+            events.push(LoopEvent { beat, on: true, note, freq, pan: 0.0 });
+            events.push(LoopEvent { beat: beat + dur.max(0.0), on: false, note, freq, pan: 0.0 });
+        }
+        events
+    }
+
+    /// A layer's events as readable `note@beat:dur` tokens — the inverse of the
+    /// `define`/`layer` format, so a loop round-trips through the interface.
+    fn layer_tokens(&self, layer: &[LoopEvent], len: f64) -> String {
+        let mut out: Vec<String> = Vec::new();
+        for on in layer.iter().filter(|e| e.on) {
+            // Pair with the nearest following off of the same note.
+            let off = layer
+                .iter()
+                .filter(|e| !e.on && e.note == on.note && e.beat > on.beat)
+                .map(|e| e.beat)
+                .min_by(|a, b| a.partial_cmp(b).unwrap())
+                .unwrap_or(len);
+            out.push(format!(
+                "{}@{}:{}",
+                note_name(on.note),
+                fmt_beat(on.beat),
+                fmt_beat(off - on.beat)
+            ));
+        }
+        out.join(" ")
     }
 
     /// Set the arpeggiator on/off (command interface), re-playing in the new mode.
@@ -1513,6 +2375,25 @@ impl App {
         if let Some((key, root)) = self.current.as_ref().map(|h| (h.key, h.root)) {
             self.play(key, root);
         }
+    }
+}
+
+/// Compact beat formatting: whole numbers as integers, else up to 4 decimals
+/// with trailing zeros trimmed (so 0.25 stays "0.25", 1.0 becomes "1").
+fn fmt_beat(x: f64) -> String {
+    if (x - x.round()).abs() < 1e-6 {
+        format!("{}", x.round() as i64)
+    } else {
+        format!("{x:.4}").trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+fn loop_state_name(s: LoopState) -> &'static str {
+    match s {
+        LoopState::Empty => "empty",
+        LoopState::Armed => "armed",
+        LoopState::Recording => "rec",
+        LoopState::Playing => "playing",
     }
 }
 
@@ -1583,7 +2464,7 @@ fn char_of(code: KeyCode) -> Option<char> {
 /// name and piano at the bottom.
 pub fn render(app: &App, frame: &mut Frame) {
     let chunks = Layout::vertical([
-        Constraint::Length(1), // status
+        Constraint::Length(1), // status + transport readout
         Constraint::Length(1), // padding
         Constraint::Min(8),    // middle panel (controls or synth editor)
         Constraint::Length(1), // chord name
@@ -1591,13 +2472,45 @@ pub fn render(app: &App, frame: &mut Frame) {
     ])
     .split(frame.area());
 
-    frame.render_widget(status(app), chunks[0]);
+    // Top line: status on the left, the transport (tempo · time · keys) right.
+    let top = Layout::horizontal([Constraint::Min(20), Constraint::Length(34)]).split(chunks[0]);
+    frame.render_widget(status(app), top[0]);
+    frame.render_widget(transport_readout(app), top[1]);
+
     match app.view {
         View::Play => frame.render_widget(controls(app), chunks[2]),
         View::Synth => render_synth(app, frame, chunks[2]),
     }
     frame.render_widget(chord_name(app), chunks[3]);
     render_piano(app, frame, chunks[4]);
+}
+
+/// The top-right transport readout: Tempo · Time-Sig · Keyboard. The selected
+/// transport cell (Left/Right on row 0) is highlighted; `+`/`-` adjust it.
+fn transport_readout(app: &App) -> Paragraph<'static> {
+    let z = note_for_key('z', app.window).map(note_name).unwrap_or_default();
+    let keys = if app.window == 0 {
+        format!("z:{z}")
+    } else {
+        format!("z:{z}{:+}", app.window)
+    };
+    let cells = [
+        format!("{}bpm", app.transport.tempo()),
+        format!("{}/4", app.beats_per_bar),
+        keys,
+    ];
+    let mut spans = Vec::new();
+    for (i, cell) in cells.into_iter().enumerate() {
+        let selected = app.sel_row == 0 && app.sel_col == i;
+        let style = if selected {
+            Style::default().fg(Color::Black).bg(ROOT_COLOR).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        spans.push(Span::styled(format!(" {cell} "), style));
+        spans.push(Span::raw(" "));
+    }
+    Paragraph::new(Line::from(spans)).alignment(Alignment::Right)
 }
 
 /// The synth editor: three columns of parameters, arrow-navigated, `-`/`+` to
@@ -1689,7 +2602,7 @@ fn controls(app: &App) -> Paragraph<'static> {
             .collect(),
     );
     let voicing = slider_line(
-        "-/+",
+        ";/'",
         "voicing",
         voicing_slider(app.voicing),
         format!("{:+}", app.voicing),
@@ -1703,7 +2616,7 @@ fn controls(app: &App) -> Paragraph<'static> {
             Some(o) => format!("root+{o}"),
         },
     );
-    Paragraph::new(vec![
+    let mut lines = vec![
         chord,
         adds,
         voicing,
@@ -1711,7 +2624,131 @@ fn controls(app: &App) -> Paragraph<'static> {
         arp_line(app),
         phrase_line(app),
         locked_row(app),
-    ])
+        Line::from(""),
+        Line::from(Span::styled(
+            "  loops  ←→ move · ↑↓ lane · space: press",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    lines.extend(loop_lanes(app));
+    Paragraph::new(lines)
+}
+
+/// One full-width lane per loop slot: state, bars, a playhead, and the
+/// mute/solo/undo/reset buttons (which appear once a slot has content). The
+/// selected cell is highlighted.
+fn loop_lanes(app: &App) -> Vec<Line<'static>> {
+    const BAR_W: usize = 14; // playhead track width
+    let mut lines = Vec::new();
+    for (i, slot) in app.loops.iter().enumerate() {
+        let row = i + 1;
+        let selected_here = app.sel_row == row;
+        let mut spans = Vec::new();
+
+        // Lane label (highlighted when the loop cell itself is selected).
+        let loop_sel = selected_here && app.sel_col == 0;
+        spans.push(Span::styled(
+            format!("  L{} ", i + 1),
+            if loop_sel {
+                Style::default().fg(Color::Black).bg(ROOT_COLOR).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            },
+        ));
+
+        // State glyph + label. An active overdub keeps the slot Playing, so
+        // check the recorder to show REC while overdubbing.
+        let overdubbing = matches!(&app.rec, Some(r) if r.slot == i && !r.defining);
+        let bars = if slot.len_beats > 0.0 {
+            (slot.len_beats / app.bar_beats()).round() as u32
+        } else {
+            0
+        };
+        // Count-in clicks remaining (first-ever recording) → show a countdown.
+        let counting = match &app.rec {
+            Some(r) if r.slot == i && !r.count_in.is_empty() => Some(r.count_in.len()),
+            _ => None,
+        };
+        // Stop pressed, but recording out the rest of the bar until the loop
+        // closes on the next bar line.
+        let ending = matches!(
+            &app.rec,
+            Some(r) if r.slot == i && r.defining && r.stop_beat.is_some()
+        );
+        let (glyph, label, color) = if ending {
+            ("◌", "ending".to_string(), Color::Yellow)
+        } else if overdubbing {
+            ("●", format!("REC {bars}b"), Color::Red)
+        } else if let Some(n) = counting {
+            ("◌", format!("count {n}"), Color::Yellow)
+        } else {
+            match slot.state {
+                LoopState::Empty => ("·", "empty".to_string(), Color::DarkGray),
+                LoopState::Armed => ("◌", "armed".to_string(), Color::Yellow),
+                LoopState::Recording => ("●", "REC".to_string(), Color::Red),
+                LoopState::Playing if slot.muted => ("○", format!("mute {bars}b"), Color::DarkGray),
+                LoopState::Playing => ("▸", format!("play {bars}b"), Color::Green),
+            }
+        };
+        spans.push(Span::styled(format!("{glyph} {label:<9}"), Style::default().fg(color)));
+
+        // Playhead track (spans the effective, division-scaled length).
+        let recording = overdubbing || slot.state == LoopState::Recording;
+        let track = if slot.has_content() && slot.span() > 0.0 {
+            let pos = (((app.now_beats() - slot.anchor_beat) * slot.speed()).rem_euclid(slot.span())
+                / slot.span()
+                * BAR_W as f64) as usize;
+            let pos = pos.min(BAR_W - 1);
+            let mut t = "▓".repeat(pos);
+            t.push('█');
+            t.push_str(&"░".repeat(BAR_W - 1 - pos));
+            t
+        } else {
+            "░".repeat(BAR_W)
+        };
+        let track_color = if ending || counting.is_some() {
+            Color::Yellow
+        } else if recording {
+            Color::Red
+        } else if slot.state == LoopState::Playing && !slot.muted {
+            Color::Green
+        } else {
+            Color::DarkGray
+        };
+        spans.push(Span::styled(format!(" {track} "), Style::default().fg(track_color)));
+
+        // Layer count, action buttons, and +/- value cells (once recorded).
+        if slot.has_content() {
+            spans.push(Span::styled(
+                format!("{}L ", slot.layers.len()),
+                Style::default().fg(Color::Gray),
+            ));
+            let cells: [(usize, String, bool); 8] = [
+                (1, slot.quantize_label().to_string(), false),
+                (2, "mute".to_string(), slot.muted),
+                (3, "solo".to_string(), slot.solo),
+                (4, "undo".to_string(), false),
+                (5, slot.division_label().to_string(), false),
+                (6, format!("{:.2}x", slot.speed()), false),
+                (7, format!("{:+}st", slot.transpose), false),
+                (8, "reset".to_string(), false),
+            ];
+            for (col, text, active) in cells {
+                let sel = selected_here && app.sel_col == col;
+                let style = if sel {
+                    Style::default().fg(Color::Black).bg(ROOT_COLOR).add_modifier(Modifier::BOLD)
+                } else if active {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                spans.push(Span::styled(format!(" {text} "), style));
+                spans.push(Span::raw(" "));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 /// The arp phrase controls that sit under the arp row: length and triplet feel.
@@ -1885,11 +2922,10 @@ fn status(app: &App) -> Paragraph<'static> {
     let release = if app.enhanced { "release on" } else { "release fallback" };
     let latch = if app.enhanced && !app.latch { "latch off" } else { "latch on" };
     let tuning = if app.just { "just" } else { "12-TET" };
-    let z = note_for_key('z', app.window).map(note_name).unwrap_or_default();
     let presets = crate::synth::presets();
     let patch = presets[app.patch_index.min(presets.len() - 1)].0;
     let text = format!(
-        "autochord · {tab} · {release} · {latch} (q) · {tuning} · z:{z} < > · patch:{patch} (PgUp/Dn) · {} {}Hz",
+        "autochord · {tab} · {release} · {latch} (q) · {tuning} · patch:{patch} (PgUp/Dn) · {} {}Hz",
         app.audio.device, app.audio.sample_rate
     );
     Paragraph::new(text)
@@ -2178,10 +3214,16 @@ mod tests {
         assert_eq!(note_for_key('f', 1), Some(66)); // above F -> F#
     }
 
-    // < / > slide the window a white key at a time
+    // Select the "keyboard" field so `+`/`-`/`<`/`>` transpose the window.
+    fn select_keyboard(a: &mut App) {
+        a.apply_command("field keyboard");
+    }
+
+    // > slides the window a white key at a time (with keyboard field selected)
     #[test]
     fn transpose_slides_the_window() {
         let mut a = app();
+        select_keyboard(&mut a);
         tap(&mut a, '>'); // one white key up: window starts on D
         tap(&mut a, 'z');
         assert_eq!(root(&a), 62); // z -> D
@@ -2196,13 +3238,16 @@ mod tests {
     fn transpose_repitches_held_not_latched() {
         // held: Kitty hold mode (latch off)
         let mut held = app();
+        select_keyboard(&mut held);
         tap(&mut held, 'q'); // latch off
         tap(&mut held, 'z'); // hold C
+        select_keyboard(&mut held); // playing doesn't move the cursor, but be explicit
         tap(&mut held, '>'); // window up while held -> z now D
         assert_eq!(root(&held), 62);
 
         // latched: press then release, chord rings on
         let mut latched = app();
+        select_keyboard(&mut latched);
         tap(&mut latched, 'z'); // press C (latch on)
         release(&mut latched, 'z'); // release -> only ringing now
         tap(&mut latched, '>'); // transpose -> must NOT move it
@@ -2213,12 +3258,56 @@ mod tests {
     #[test]
     fn repress_after_transpose_uses_new_pitch() {
         let mut a = app(); // latch on
+        select_keyboard(&mut a);
         tap(&mut a, 'z'); // C (60), latched
         release(&mut a, 'z'); // ringing, not held
         tap(&mut a, '>'); // window up — ringing chord stays put
         assert_eq!(root(&a), 60);
         tap(&mut a, 'z'); // re-hit z -> now D (62)
         assert_eq!(root(&a), 62);
+    }
+
+    // Field navigation: arrows move the cursor; +/- adjust the selected field.
+    #[test]
+    fn field_navigation_and_adjust() {
+        let mut a = app();
+        // Cursor starts on tempo; +/- change BPM by 1.
+        let t0 = a.transport.tempo();
+        tap(&mut a, '+');
+        assert_eq!(a.transport.tempo(), t0 + 1);
+        tap(&mut a, '-');
+        assert_eq!(a.transport.tempo(), t0);
+
+        // Right to time-sig; adjust toggles 4/4 <-> 3/4.
+        a.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(a.beats_per_bar, 4);
+        tap(&mut a, '+');
+        assert_eq!(a.beats_per_bar, 3);
+
+        // Right again to keyboard; > transposes.
+        a.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        tap(&mut a, '>');
+        assert_eq!(a.window, 1);
+
+        // Voicing moved to ; / '
+        let v0 = a.voicing;
+        tap(&mut a, '\'');
+        assert_eq!(a.voicing, v0 + 1);
+        tap(&mut a, ';');
+        assert_eq!(a.voicing, v0);
+    }
+
+    // Time signature round-trips through the text interface.
+    #[test]
+    fn timesig_command_round_trip() {
+        let mut a = app();
+        a.apply_command("timesig 3/4");
+        assert_eq!(a.beats_per_bar, 3);
+        assert!(a.state_text().contains("timesig 3/4"));
+        a.apply_command("timesig 4"); // bare numerator also accepted
+        assert_eq!(a.beats_per_bar, 4);
+        a.apply_command("timesig 7"); // unsupported -> ignored
+        assert_eq!(a.beats_per_bar, 4);
     }
 
     // `/` toggles the arpeggiator
@@ -2429,5 +3518,280 @@ mod tests {
 
         a.apply_command("patch 0"); // return to our edited slot
         assert!((a.patch.cutoff - 4321.0).abs() < 1.0); // edit survived
+    }
+
+    // --- loop recorder -----------------------------------------------------
+
+    // Give a slot fabricated content so its action buttons/lane are testable
+    // without a real timed recording.
+    fn fill_loop(a: &mut App, slot: usize, events: Vec<LoopEvent>, len_beats: f64) {
+        a.loops[slot] = LoopSlot {
+            state: LoopState::Playing,
+            layers: vec![events],
+            len_beats,
+            anchor_beat: 0.0,
+            ..LoopSlot::default()
+        };
+    }
+
+    fn ev(beat: f64, on: bool, note: u8) -> LoopEvent {
+        LoopEvent { beat, on, note, freq: 440.0, pan: 0.0 }
+    }
+
+    #[test]
+    fn grid_nav_widths_and_field_names() {
+        let mut a = app();
+        assert_eq!(a.selected_field_name(), "tempo");
+        // Row 0 has 3 cells: tempo, timesig, keyboard.
+        a.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(a.selected_field_name(), "timesig");
+        a.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(a.selected_field_name(), "keyboard");
+        a.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)); // clamp
+        assert_eq!(a.selected_field_name(), "keyboard");
+
+        // Down to L1. Empty slot has only the loop cell.
+        a.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(a.selected_field_name(), "loop1");
+        assert_eq!(a.row_width(1), 1);
+        a.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)); // no button cells yet
+        assert_eq!(a.selected_field_name(), "loop1");
+
+        // With content, the lane exposes quantize/mute/solo/undo/div/speed/
+        // transpose/reset.
+        fill_loop(&mut a, 0, vec![ev(0.0, true, 60), ev(1.0, false, 60)], 4.0);
+        assert_eq!(a.row_width(1), 9);
+        a.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(a.selected_field_name(), "loop1.quantize");
+    }
+
+    #[test]
+    fn loop_division_speed_transpose() {
+        let mut a = app();
+        fill_loop(&mut a, 0, vec![ev(0.0, true, 60)], 4.0);
+        assert!((a.loops[0].span() - 4.0).abs() < 1e-9); // full loop
+
+        // Division: cell 4, +/- cycles the fraction that plays.
+        a.select_field("loop1.div");
+        tap(&mut a, '+'); // 1/1 -> 1/2
+        assert_eq!(a.loops[0].division_label(), "1/2");
+        assert!((a.loops[0].span() - 2.0).abs() < 1e-9);
+
+        // Speed: cell 5, increments the playback rate.
+        a.select_field("loop1.speed");
+        tap(&mut a, '+');
+        assert!((a.loops[0].speed() - 1.25).abs() < 1e-9);
+
+        // Transpose: cell 6, shifts semitones.
+        a.select_field("loop1.transpose");
+        tap(&mut a, '+');
+        tap(&mut a, '+');
+        assert_eq!(a.loops[0].transpose, 2);
+
+        // Same via the text interface.
+        a.apply_command("loop1 div 1/4");
+        assert_eq!(a.loops[0].division_label(), "1/4");
+        a.apply_command("loop1 speed 2.0");
+        assert!((a.loops[0].speed() - 2.0).abs() < 1e-9);
+        a.apply_command("loop1 transpose -5");
+        assert_eq!(a.loops[0].transpose, -5);
+    }
+
+    #[test]
+    fn ai_can_define_and_read_a_loop() {
+        let mut a = app(); // 4/4
+        a.apply_command("loop1 define 1 C4@0:1 E4@1:1 G4@2:2");
+        let s = &a.loops[0];
+        assert_eq!(s.state, LoopState::Playing);
+        assert!((s.len_beats - 4.0).abs() < 1e-9); // 1 bar of 4 beats
+        assert_eq!(s.layers.len(), 1);
+        assert_eq!(s.layers[0].len(), 6); // three notes -> three on/off pairs
+        assert_eq!(s.quantize_idx, 0); // free, so authored timing is exact
+
+        // Overdub an authored layer.
+        a.apply_command("loop1 layer C3@0:4");
+        assert_eq!(a.loops[0].layers.len(), 2);
+
+        // Read it back: the state exposes the notes in the same format.
+        let text = a.state_text();
+        assert!(text.contains("loop1 playing 1bars 2layers"));
+        assert!(text.contains("loop1.layer1 C4@0:1 E4@1:1 G4@2:2"));
+        assert!(text.contains("loop1.layer2 C3@0:4"));
+    }
+
+    #[test]
+    fn quantize_snaps_playback_non_destructively() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let monitor = Arc::new(VoiceMonitor::new());
+        let audio = AudioInfo { device: "test".into(), sample_rate: 48000 };
+        let mut a = App::new(tx, audio, true, true, monitor, Transport::disconnected());
+        while rx.try_recv().is_ok() {}
+
+        // One note recorded off the grid at beat 0.4 in a 4-beat loop.
+        fill_loop(&mut a, 0, vec![ev(0.4, true, 60)], 4.0);
+
+        // Quantize 1/4 (grid 1.0) snaps 0.4 -> 0.0, so it fires at the downbeat.
+        a.loops[0].quantize_idx = 1; // "1/4"
+        a.play_loop_slot(0, 0.2, false);
+        let quantized = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|e| matches!(e, SynthEvent::NoteOn { .. }))
+            .count();
+        assert_eq!(quantized, 1, "quantized note snaps forward to the downbeat");
+        // The stored event keeps its exact beat — quantize is non-destructive.
+        assert!((a.loops[0].layers[0][0].beat - 0.4).abs() < 1e-9);
+
+        // Free (as recorded): the same note does NOT fire before beat 0.4.
+        a.loops[0].quantize_idx = 0; // "free"
+        a.loops[0].played_to = 0.0;
+        a.loops[0].sounding.clear();
+        while rx.try_recv().is_ok() {}
+        a.play_loop_slot(0, 0.2, false);
+        let free = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|e| matches!(e, SynthEvent::NoteOn { .. }))
+            .count();
+        assert_eq!(free, 0, "free timing fires at 0.4, not before");
+    }
+
+    #[test]
+    fn loop_transpose_shifts_played_notes() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let monitor = Arc::new(VoiceMonitor::new());
+        let audio = AudioInfo { device: "test".into(), sample_rate: 48000 };
+        let mut a = App::new(tx, audio, true, true, monitor, Transport::disconnected());
+        while rx.try_recv().is_ok() {}
+        fill_loop(&mut a, 0, vec![ev(0.0, true, 60)], 4.0);
+        a.loops[0].transpose = 5; // up a fourth
+        a.play_loop_slot(0, 0.5, false);
+        let ons: Vec<u16> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|e| match e {
+                SynthEvent::NoteOn { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect();
+        // Note 60 + 5 = 65, on slot 0's voice source (1).
+        assert_eq!(ons, vec![voice_id(1, 65)]);
+    }
+
+    #[test]
+    fn loop_mute_solo_undo_reset_commands() {
+        let mut a = app();
+        fill_loop(&mut a, 0, vec![ev(0.0, true, 60)], 4.0);
+        a.loops[0].layers.push(vec![ev(1.0, true, 64)]); // a second layer
+
+        a.apply_command("loop1 mute");
+        assert!(a.loops[0].muted);
+        a.apply_command("loop1 unmute");
+        assert!(!a.loops[0].muted);
+
+        a.apply_command("loop1 solo");
+        assert!(a.loops[0].solo);
+
+        // Undo pops the last layer; the loop survives.
+        a.apply_command("loop1 undo");
+        assert_eq!(a.loops[0].layers.len(), 1);
+        assert!(a.loops[0].has_content());
+
+        // Reset wipes it back to empty.
+        a.apply_command("loop1 reset");
+        assert!(!a.loops[0].has_content());
+        assert_eq!(a.loops[0].state, LoopState::Empty);
+    }
+
+    #[test]
+    fn recording_arms_on_empty_slot() {
+        let mut a = app();
+        a.select_field("loop2");
+        a.press_loop_button(); // Space on empty loop cell -> arm
+        assert!(matches!(&a.rec, Some(r) if r.slot == 1 && r.defining));
+        assert_eq!(a.loops[1].state, LoopState::Armed);
+        // Space again marks a bar-aligned stop.
+        a.press_loop_button();
+        assert!(matches!(&a.rec, Some(r) if r.stop_beat.is_some()));
+    }
+
+    #[test]
+    fn recording_snapshots_already_sounding_notes() {
+        let mut a = app();
+        // A chord already latched/sounding on the live source.
+        a.sent = vec![(60, 261.6, 0.0), (64, 329.6, 0.0)];
+        // A defining recording that has already started (start in the past).
+        a.rec = Some(Recording {
+            slot: 0,
+            defining: true,
+            start_beat: 0.0,
+            stop_beat: None,
+            events: Vec::new(),
+            count_in: Vec::new(),
+        });
+        a.snapshot_live();
+        let notes: Vec<u8> = a
+            .rec
+            .as_ref()
+            .unwrap()
+            .events
+            .iter()
+            .filter(|e| e.on)
+            .map(|e| e.note)
+            .collect();
+        assert_eq!(notes, vec![60, 64]);
+    }
+
+    #[test]
+    fn loop_playback_fires_events_on_its_own_source() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let monitor = Arc::new(VoiceMonitor::new());
+        let audio = AudioInfo { device: "test".into(), sample_rate: 48000 };
+        let mut a = App::new(tx, audio, true, true, monitor, Transport::disconnected());
+        while rx.try_recv().is_ok() {}
+
+        // A 4-beat loop: note 60 on at beat 0, off at beat 1.
+        fill_loop(&mut a, 0, vec![ev(0.0, true, 60), ev(1.0, false, 60)], 4.0);
+
+        // Advance playback from beat 0 to 0.5 — the on at 0 should fire.
+        a.play_loop_slot(0, 0.5, false);
+        let ons: Vec<u16> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|e| match e {
+                SynthEvent::NoteOn { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect();
+        // Slot 0 uses voice source 1 -> id = (1<<8)|60.
+        assert_eq!(ons, vec![voice_id(1, 60)]);
+
+        // Advance to 1.5 — the off at 1 fires on the same source.
+        a.play_loop_slot(0, 1.5, false);
+        let offs: Vec<u16> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|e| match e {
+                SynthEvent::NoteOff { id } => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(offs, vec![voice_id(1, 60)]);
+    }
+
+    #[test]
+    fn solo_silences_other_slots() {
+        let mut a = app();
+        fill_loop(&mut a, 0, vec![ev(0.0, true, 60)], 4.0);
+        fill_loop(&mut a, 1, vec![ev(0.0, true, 67)], 4.0);
+        a.loops[1].sounding = vec![67]; // pretend it's sounding
+        a.loops[0].solo = true;
+
+        // With slot 0 soloed, slot 1 is inaudible and gets silenced.
+        a.play_loop_slot(1, 0.5, /*any_solo*/ true);
+        assert!(a.loops[1].sounding.is_empty());
+    }
+
+    #[test]
+    fn state_text_reports_loops() {
+        let mut a = app();
+        let s = a.state_text();
+        assert!(s.contains("loop1 empty 0bars 0layers"));
+        fill_loop(&mut a, 0, vec![ev(0.0, true, 60)], 8.0);
+        a.loops[0].muted = true;
+        let s = a.state_text();
+        assert!(s.contains(
+            "loop1 playing 2bars 1layers quantize 1/16 div 1/1 speed 1.00x transpose 0 muted"
+        ));
     }
 }

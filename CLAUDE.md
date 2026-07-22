@@ -9,6 +9,8 @@ edit a full subtractive synth engine — all from the keyboard.
 
 - `src/main.rs` — entry point; CLI subcommand dispatch, then the TUI run loop.
 - `src/app.rs` — all app state, key handling, the latch/lock model, arpeggiator,
+  the navigable play-page grid (`sel_row`/`sel_col`), the multitrack loop
+  recorder (`LoopSlot`/`Recording`, baked note-tapes on per-source voice ids),
   the synth editor, and the **text control interface** (`serve`, `state_text`,
   `apply_command`, and the `Param` key/raw/set_raw machinery).
 - `src/synth.rs` — the DSP: oscillators, filter, envelopes, LFOs, voices; the

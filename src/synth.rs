@@ -512,6 +512,11 @@ impl Env {
         self.stage != Stage::Idle
     }
 
+    /// True while the note is held (pre-release) — what the piano display uses.
+    fn gated(&self) -> bool {
+        matches!(self.stage, Stage::Attack | Stage::Decay | Stage::Sustain)
+    }
+
     fn next(&mut self, adsr: &Adsr, sr: f32) -> f32 {
         let per = |t: f32| 1.0 / (t.max(0.0005) * sr);
         match self.stage {
@@ -581,7 +586,10 @@ fn pan_gains(pan: f32) -> (f32, f32) {
 /// One sounding note: two oscillators + noise, amp & filter envelopes, and a
 /// stereo pair of filters (so per-oscillator panning survives filtering).
 struct Voice {
-    id: u8,
+    /// Voice key: high byte = source (0 live, 1..=N loop slots), low byte = MIDI
+    /// note. Namespacing by source lets layered loops sound the same pitch on
+    /// independent voices without stomping each other's note-offs or envelopes.
+    id: u16,
     freq: f32,  // target base frequency
     glide: f32, // current base frequency (portamentos toward `freq`)
     spread: f32, // stereo-spread pan offset (-1..1), from note position in the chord
@@ -594,7 +602,7 @@ struct Voice {
 }
 
 impl Voice {
-    fn new(id: u8, freq: f32) -> Self {
+    fn new(id: u16, freq: f32) -> Self {
         Self {
             id,
             freq,
@@ -684,6 +692,11 @@ pub struct Synth {
     last_freq: f32, // most recent note pitch — the glide origin for portamento
     rng: u32,
     monitor: Arc<VoiceMonitor>,
+    /// Metronome click state: a short decaying sine blip, independent of the
+    /// patch, used for the loop-recorder count-in.
+    click_env: f32,
+    click_phase: f32,
+    click_freq: f32,
 }
 
 impl Synth {
@@ -697,6 +710,9 @@ impl Synth {
             last_freq: 220.0,
             rng: 0x1234_5678,
             monitor,
+            click_env: 0.0,
+            click_phase: 0.0,
+            click_freq: 1000.0,
         }
     }
 
@@ -704,9 +720,17 @@ impl Synth {
         self.patch = patch;
     }
 
+    /// Trigger a metronome click (count-in). Accented clicks (the downbeat) ring
+    /// higher. It's a fixed short blip, not shaped by the patch.
+    pub fn click(&mut self, accent: bool) {
+        self.click_env = 1.0;
+        self.click_phase = 0.0;
+        self.click_freq = if accent { 1600.0 } else { 1000.0 };
+    }
+
     /// Start (or retrigger) a tone with the given id at `freq`, panned by `pan`
     /// (stereo spread from its position in the chord).
-    pub fn note_on(&mut self, id: u8, freq: f32, pan: f32) {
+    pub fn note_on(&mut self, id: u16, freq: f32, pan: f32) {
         if let Some(voice) = self.voices.iter_mut().find(|v| v.id == id) {
             voice.spread = pan;
             voice.gate_on(freq); // glide continues from the voice's current pitch
@@ -719,15 +743,26 @@ impl Synth {
             self.voices.push(voice);
         }
         self.last_freq = freq;
-        self.monitor.set(id, true);
+        self.refresh_monitor((id & 0xFF) as u8);
     }
 
     /// Release the tone with the given id (it fades out over its release stage).
-    pub fn note_off(&mut self, id: u8) {
+    pub fn note_off(&mut self, id: u16) {
         if let Some(voice) = self.voices.iter_mut().find(|v| v.id == id) {
             voice.gate_off();
         }
-        self.monitor.set(id, false);
+        self.refresh_monitor((id & 0xFF) as u8);
+    }
+
+    /// Light the piano key for `note` iff some source still holds it (gated on),
+    /// so a note-off from one source doesn't dark a key another source is
+    /// playing at the same pitch.
+    fn refresh_monitor(&self, note: u8) {
+        let held = self
+            .voices
+            .iter()
+            .any(|v| (v.id & 0xFF) as u8 == note && v.amp.gated());
+        self.monitor.set(note, held);
     }
 
     /// Produce one stereo frame `(left, right)` and advance every voice.
@@ -758,7 +793,22 @@ impl Synth {
         self.voices.retain(|v| v.amp.active());
 
         let m = patch.master;
-        ((l * m).clamp(-1.0, 1.0), (r * m).clamp(-1.0, 1.0))
+        let mut l = l * m;
+        let mut r = r * m;
+
+        // Metronome click: a short decaying sine, mixed in at a fixed level
+        // above the patch so the count-in is always audible.
+        if self.click_env > 0.0005 {
+            let s = (self.click_phase * TAU).sin() * self.click_env * 0.4;
+            l += s;
+            r += s;
+            self.click_phase = (self.click_phase + self.click_freq / sr).fract();
+            self.click_env *= (-30.0 / sr).exp(); // ~30ms decay
+        } else {
+            self.click_env = 0.0;
+        }
+
+        (l.clamp(-1.0, 1.0), r.clamp(-1.0, 1.0))
     }
 }
 
