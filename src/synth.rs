@@ -684,8 +684,12 @@ fn white(rng: &mut u32) -> f32 {
 // ride). Indexed by `inst`; the order must match `app::DrumInst`.
 // ===========================================================================
 
-/// Max lifetime (seconds) per drum instrument, after which the voice is reaped.
-const DRUM_LIFE: [f32; 7] = [0.6, 0.4, 0.12, 0.5, 0.5, 0.6, 0.9];
+/// Max lifetime (seconds) per drum instrument, after which the voice is reaped
+/// (scaled by the hit's release). Order matches `app::DrumInst`.
+const DRUM_LIFE: [f32; 13] = [
+    0.6, 0.4, 0.12, 0.5, 0.5, 0.6, 0.9, // kick snare hihat openhat cowbell tom ride
+    0.4, 0.08, 0.12, 0.08, 0.5, 1.4, // clap rim clave maracas conga crash
+];
 
 #[derive(Clone, Copy)]
 struct DrumVoice {
@@ -695,72 +699,121 @@ struct DrumVoice {
     phase2: f32,
     lp: f32, // one-pole state, for shaping noise on snare/hats/ride
     rng: u32,
+    pitch: f32,   // frequency multiplier (per-track tune)
+    release: f32, // decay multiplier (per-track release)
+    level: f32,   // amplitude
+    pan: f32,     // -1 (L) .. +1 (R)
 }
 
 impl DrumVoice {
-    fn new(inst: u8, rng: u32) -> Self {
-        Self { inst, age: 0.0, phase: 0.0, phase2: 0.0, lp: 0.0, rng }
+    fn new(inst: u8, rng: u32, pitch: f32, release: f32, level: f32, pan: f32) -> Self {
+        Self {
+            inst,
+            age: 0.0,
+            phase: 0.0,
+            phase2: 0.0,
+            lp: 0.0,
+            rng,
+            pitch,
+            release,
+            level,
+            pan,
+        }
     }
 
     fn active(&self) -> bool {
-        self.age < DRUM_LIFE[(self.inst as usize).min(6)]
+        self.age < DRUM_LIFE[(self.inst as usize).min(DRUM_LIFE.len() - 1)] * self.release
     }
 
-    /// One mono sample; advances the voice by one frame.
-    fn render(&mut self, sr: f32) -> f32 {
+    /// One stereo sample `(l, r)`; advances the voice by one frame. `pitch`
+    /// multiplies tonal frequencies (and brightens noise), `release` stretches
+    /// the decays.
+    fn render(&mut self, sr: f32) -> (f32, f32) {
         let a = self.age;
-        let sq = |p: f32| if p < 0.5 { 1.0 } else { -1.0 };
+        let p = self.pitch;
+        let r = self.release;
+        let sq = |ph: f32| if ph < 0.5 { 1.0 } else { -1.0 };
+        // High-passed noise with a pitch-brightened cutoff, reused by several.
+        let hp = |lp: &mut f32, rng: &mut u32, coeff: f32| {
+            let n = white(rng);
+            *lp += (coeff * p).clamp(0.05, 0.98) * (n - *lp);
+            n - *lp
+        };
         let s = match self.inst {
             0 => {
                 // Kick: pitch drops 130→50 Hz, exp amp decay.
-                let f = 50.0 + 80.0 * (-a / 0.03).exp();
+                let f = (50.0 + 80.0 * (-a / (0.03 * r)).exp()) * p;
                 self.phase = (self.phase + f / sr).fract();
-                (self.phase * TAU).sin() * (-a / 0.25).exp()
+                (self.phase * TAU).sin() * (-a / (0.25 * r)).exp()
             }
             5 => {
                 // Tom: like the kick, higher and a touch longer.
-                let f = 90.0 + 100.0 * (-a / 0.06).exp();
+                let f = (90.0 + 100.0 * (-a / (0.06 * r)).exp()) * p;
                 self.phase = (self.phase + f / sr).fract();
-                (self.phase * TAU).sin() * (-a / 0.3).exp()
+                (self.phase * TAU).sin() * (-a / (0.3 * r)).exp()
             }
             1 => {
                 // Snare: a 180 Hz body plus high-passed noise.
-                self.phase = (self.phase + 180.0 / sr).fract();
-                let tone = (self.phase * TAU).sin() * (-a / 0.08).exp() * 0.5;
-                let n = white(&mut self.rng);
-                self.lp += 0.6 * (n - self.lp);
-                (n - self.lp) * (-a / 0.2).exp() * 0.7 + tone
+                self.phase = (self.phase + 180.0 * p / sr).fract();
+                let tone = (self.phase * TAU).sin() * (-a / (0.08 * r)).exp() * 0.5;
+                hp(&mut self.lp, &mut self.rng, 0.6) * (-a / (0.2 * r)).exp() * 0.7 + tone
             }
             2 => {
                 // Closed hat: short burst of high-passed noise.
-                let n = white(&mut self.rng);
-                self.lp += 0.75 * (n - self.lp);
-                (n - self.lp) * (-a / 0.04).exp() * 0.7
+                hp(&mut self.lp, &mut self.rng, 0.75) * (-a / (0.04 * r)).exp() * 0.7
             }
             3 => {
                 // Open hat: longer high-passed noise.
-                let n = white(&mut self.rng);
-                self.lp += 0.75 * (n - self.lp);
-                (n - self.lp) * (-a / 0.35).exp() * 0.5
+                hp(&mut self.lp, &mut self.rng, 0.75) * (-a / (0.35 * r)).exp() * 0.5
             }
             4 => {
                 // Cowbell: two detuned squares.
-                self.phase = (self.phase + 540.0 / sr).fract();
-                self.phase2 = (self.phase2 + 800.0 / sr).fract();
-                (sq(self.phase) + sq(self.phase2)) * 0.25 * (-a / 0.2).exp()
+                self.phase = (self.phase + 540.0 * p / sr).fract();
+                self.phase2 = (self.phase2 + 800.0 * p / sr).fract();
+                (sq(self.phase) + sq(self.phase2)) * 0.25 * (-a / (0.2 * r)).exp()
             }
             6 => {
                 // Ride: metallic — high tone plus bright noise, long decay.
-                self.phase = (self.phase + 3200.0 / sr).fract();
+                self.phase = (self.phase + 3200.0 * p / sr).fract();
                 let tone = sq(self.phase) * 0.15;
-                let n = white(&mut self.rng);
-                self.lp += 0.85 * (n - self.lp);
-                ((n - self.lp) * 0.4 + tone) * (-a / 0.6).exp()
+                (hp(&mut self.lp, &mut self.rng, 0.85) * 0.4 + tone) * (-a / (0.6 * r)).exp()
+            }
+            7 => {
+                // Clap: bright noise with a fast slap.
+                hp(&mut self.lp, &mut self.rng, 0.55) * (-a / (0.16 * r)).exp() * 0.6
+            }
+            8 => {
+                // Rimshot: a very short high tone click.
+                self.phase = (self.phase + 1700.0 * p / sr).fract();
+                (self.phase * TAU).sin() * (-a / (0.02 * r)).exp() * 0.7
+            }
+            9 => {
+                // Clave: a bright woodblock tone.
+                self.phase = (self.phase + 2500.0 * p / sr).fract();
+                (self.phase * TAU).sin() * (-a / (0.03 * r)).exp() * 0.6
+            }
+            10 => {
+                // Maracas: a very short bright noise shake.
+                hp(&mut self.lp, &mut self.rng, 0.5) * (-a / (0.03 * r)).exp() * 0.5
+            }
+            11 => {
+                // Conga: a tight pitched drum, higher than the tom.
+                let f = (220.0 + 60.0 * (-a / (0.05 * r)).exp()) * p;
+                self.phase = (self.phase + f / sr).fract();
+                (self.phase * TAU).sin() * (-a / (0.35 * r)).exp()
+            }
+            12 => {
+                // Crash: long, bright, shimmering cymbal.
+                self.phase = (self.phase + 5200.0 * p / sr).fract();
+                let tone = sq(self.phase) * 0.1;
+                (hp(&mut self.lp, &mut self.rng, 0.9) * 0.5 + tone) * (-a / (0.9 * r)).exp()
             }
             _ => 0.0,
         };
         self.age += 1.0 / sr;
-        s
+        let (lg, rg) = pan_gains(self.pan);
+        let out = s * self.level;
+        (out * lg, out * rg)
     }
 }
 
@@ -804,13 +857,15 @@ impl Synth {
         }
     }
 
-    /// Trigger an 808-style drum one-shot (`inst` indexes the kit).
-    pub fn drum_hit(&mut self, inst: u8) {
+    /// Trigger an 808-style drum one-shot (`inst` indexes the kit), tuned and
+    /// shaped by the per-track `pitch`/`release`/`level`/`pan`.
+    pub fn drum_hit(&mut self, inst: u8, pitch: f32, release: f32, level: f32, pan: f32) {
         // Advance the shared rng so each hit's noise differs.
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 17;
         self.rng ^= self.rng << 5;
-        self.drum_voices.push(DrumVoice::new(inst, self.rng));
+        self.drum_voices
+            .push(DrumVoice::new(inst, self.rng, pitch, release, level, pan));
     }
 
     pub fn set_patch(&mut self, patch: Patch) {
@@ -893,15 +948,17 @@ impl Synth {
         let mut l = l * m;
         let mut r = r * m;
 
-        // Drum voices, mixed centered at a fixed level (independent of the
-        // melodic patch/master).
-        let mut drums = 0.0;
+        // Drum voices, mixed at a fixed level (independent of the melodic
+        // patch/master), each panned per its track.
+        let (mut dl, mut dr) = (0.0, 0.0);
         for dv in &mut self.drum_voices {
-            drums += dv.render(sr);
+            let (vl, vr) = dv.render(sr);
+            dl += vl;
+            dr += vr;
         }
         self.drum_voices.retain(|v| v.active());
-        l += drums * 0.5;
-        r += drums * 0.5;
+        l += dl * 0.5;
+        r += dr * 0.5;
 
         // Metronome click: a short decaying sine, mixed in at a fixed level
         // above the patch so the count-in is always audible.
@@ -961,10 +1018,12 @@ mod tests {
     #[test]
     fn drums_stay_finite_and_in_range() {
         let mut s = Synth::new(48_000.0, Arc::new(VoiceMonitor::new()));
-        for inst in 0..7 {
-            s.drum_hit(inst);
+        // Every instrument, with extreme tune/release/level/pan.
+        for inst in 0..13 {
+            s.drum_hit(inst, 2.0, 4.0, 1.5, -1.0);
+            s.drum_hit(inst, 0.5, 0.25, 1.5, 1.0);
         }
-        run(&mut s, 48_000); // ~1s: all voices decay and reap
+        run(&mut s, 48_000 * 6); // ~6s: even the longest (crash × release 4) reaps
         assert!(s.drum_voices.is_empty(), "drum voices should be reaped");
     }
 }

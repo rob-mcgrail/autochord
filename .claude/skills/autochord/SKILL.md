@@ -154,16 +154,21 @@ format `define` takes, so loops round-trip through the interface.
 ### Drum machine
 
 An 808-style 16-step sequencer, 8 tracks, on the shared 16th grid. Kit
-instruments: `kick snare hihat openhat cowbell tom ride`.
+instruments (13): `kick snare hihat openhat cowbell tom ride clap rim clave
+maracas conga crash`.
 
 - `drums.track <1-8>` — selected track. `drums.on on|off` — sequencer enable.
   `drums.tap on|off` — tap-record arm. `drums.hit <inst>` — trigger a drum once.
 - `drumN.inst <inst>` — track N's instrument (N = 1..8).
 - `drumN.steps <16 chars>` — track N's pattern; `x`/`1`/`#`/`*` = hit, anything
   else (e.g. `.`) = rest. e.g. `drum1.steps x...x...x...x...` (four-on-the-floor).
+- Per-track voice/clock: `drumN.release <0.25-4>`, `drumN.pitch <-24..24>`
+  (semitones), `drumN.level <0-1.5>`, `drumN.pan <-1..1>`, `drumN.solo on|off`,
+  `drumN.mute on|off`, `drumN.div <1/1|1/2|1/4|1/8>` (fraction of the 16 steps
+  that plays), `drumN.speed <0.25-4>x` (per-track playback rate).
 
-Each track reads back as `drumN.inst <inst>` + `drumN.steps <pattern>`, so beats
-round-trip through the interface.
+Each track reads back as `drumN.inst`, `drumN.steps`, and each of the params
+above, so beats round-trip through the interface.
 
 Unknown keys and unparseable values are ignored. Values are clamped to valid
 ranges.

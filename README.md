@@ -167,19 +167,25 @@ A third **Tab** press opens an **808-style step sequencer** — eight tracks of 
 16-step grid, running on the same shared clock (16th notes, so a groove stays
 locked to the arp and loops, across instances).
 
-- **`z`–`m`** live-trigger the seven-piece kit: **kick · snare · hihat · open
-  hat · cowbell · tom · ride**.
-- **Number keys 1–8** select a track (your step position stays put).
-- **`q`–`i`** toggle steps 1–8 of the selected track, **`a`–`k`** steps 9–16.
-- **`,` / `.`** (or `-` / `+`) change the selected track's instrument — so you
-  can stack, say, eight kick tracks for 16ths, or any mix.
+- **`z`–`m`** live-trigger tracks 1–7 (each pad plays that track's tuned sound).
+- **Number keys 1–8** select a track; **`q`–`i`** toggle its steps 1–8, **`a`–`k`**
+  steps 9–16.
+- **13-piece kit** (assign any track to any of them with the instrument cell):
+  **kick · snare · hihat · open hat · cowbell · tom · ride · clap · rim · clave ·
+  maracas · conga · crash** — so you can stack eight kicks for 16ths, or any mix.
+- **Per-track controls** to the right of the steps — arrow **←/→** to select a
+  cell, **`+` / `-`** to adjust: **instrument · release · pitch · volume · pan ·
+  solo · mute · divide · speed**. Divide/speed give each track its own clock
+  (e.g. one lane on 8ths, another ripping 32nds); pitch/release/volume/pan shape
+  each hit; solo/mute per track.
 - **Space** arms **tap-record**: hit the `z`–`m` pads in time and they land
-  **quantized** onto the grid (into the first track holding that instrument).
+  **quantized** onto the selected track's grid.
 
-The playhead lights the current column as it sweeps. The whole kit keeps
-grooving while you're on other tabs. Everything is exposed to the text
-interface — `drumN.inst`, `drumN.steps` (a 16-char `x`/`.` pattern),
-`drums.track`, `drums.on`, `drums.tap`, and `drums.hit <inst>` — so agents can
+The playhead lights each track's current column as it sweeps (respecting that
+track's divide/speed). The whole kit keeps grooving while you're on other tabs.
+Everything is exposed to the text interface — `drumN.inst`, `drumN.steps`
+(a 16-char `x`/`.` pattern), `drumN.release|pitch|level|pan|solo|mute|div|speed`,
+`drums.track`, `drums.on`, `drums.tap`, `drums.hit <inst>` — so agents can
 program beats too.
 
 ## Text control interface (for agents & scripts)
