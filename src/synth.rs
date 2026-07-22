@@ -680,6 +680,91 @@ fn white(rng: &mut u32) -> f32 {
 }
 
 // ===========================================================================
+// Drum voices — simple 808-style one-shots (kick, snare, hats, cowbell, tom,
+// ride). Indexed by `inst`; the order must match `app::DrumInst`.
+// ===========================================================================
+
+/// Max lifetime (seconds) per drum instrument, after which the voice is reaped.
+const DRUM_LIFE: [f32; 7] = [0.6, 0.4, 0.12, 0.5, 0.5, 0.6, 0.9];
+
+#[derive(Clone, Copy)]
+struct DrumVoice {
+    inst: u8,
+    age: f32, // seconds since the hit
+    phase: f32,
+    phase2: f32,
+    lp: f32, // one-pole state, for shaping noise on snare/hats/ride
+    rng: u32,
+}
+
+impl DrumVoice {
+    fn new(inst: u8, rng: u32) -> Self {
+        Self { inst, age: 0.0, phase: 0.0, phase2: 0.0, lp: 0.0, rng }
+    }
+
+    fn active(&self) -> bool {
+        self.age < DRUM_LIFE[(self.inst as usize).min(6)]
+    }
+
+    /// One mono sample; advances the voice by one frame.
+    fn render(&mut self, sr: f32) -> f32 {
+        let a = self.age;
+        let sq = |p: f32| if p < 0.5 { 1.0 } else { -1.0 };
+        let s = match self.inst {
+            0 => {
+                // Kick: pitch drops 130→50 Hz, exp amp decay.
+                let f = 50.0 + 80.0 * (-a / 0.03).exp();
+                self.phase = (self.phase + f / sr).fract();
+                (self.phase * TAU).sin() * (-a / 0.25).exp()
+            }
+            5 => {
+                // Tom: like the kick, higher and a touch longer.
+                let f = 90.0 + 100.0 * (-a / 0.06).exp();
+                self.phase = (self.phase + f / sr).fract();
+                (self.phase * TAU).sin() * (-a / 0.3).exp()
+            }
+            1 => {
+                // Snare: a 180 Hz body plus high-passed noise.
+                self.phase = (self.phase + 180.0 / sr).fract();
+                let tone = (self.phase * TAU).sin() * (-a / 0.08).exp() * 0.5;
+                let n = white(&mut self.rng);
+                self.lp += 0.6 * (n - self.lp);
+                (n - self.lp) * (-a / 0.2).exp() * 0.7 + tone
+            }
+            2 => {
+                // Closed hat: short burst of high-passed noise.
+                let n = white(&mut self.rng);
+                self.lp += 0.75 * (n - self.lp);
+                (n - self.lp) * (-a / 0.04).exp() * 0.7
+            }
+            3 => {
+                // Open hat: longer high-passed noise.
+                let n = white(&mut self.rng);
+                self.lp += 0.75 * (n - self.lp);
+                (n - self.lp) * (-a / 0.35).exp() * 0.5
+            }
+            4 => {
+                // Cowbell: two detuned squares.
+                self.phase = (self.phase + 540.0 / sr).fract();
+                self.phase2 = (self.phase2 + 800.0 / sr).fract();
+                (sq(self.phase) + sq(self.phase2)) * 0.25 * (-a / 0.2).exp()
+            }
+            6 => {
+                // Ride: metallic — high tone plus bright noise, long decay.
+                self.phase = (self.phase + 3200.0 / sr).fract();
+                let tone = sq(self.phase) * 0.15;
+                let n = white(&mut self.rng);
+                self.lp += 0.85 * (n - self.lp);
+                ((n - self.lp) * 0.4 + tone) * (-a / 0.6).exp()
+            }
+            _ => 0.0,
+        };
+        self.age += 1.0 / sr;
+        s
+    }
+}
+
+// ===========================================================================
 // Synth — the polyphonic engine
 // ===========================================================================
 
@@ -697,6 +782,8 @@ pub struct Synth {
     click_env: f32,
     click_phase: f32,
     click_freq: f32,
+    /// Sounding 808-style drum one-shots.
+    drum_voices: Vec<DrumVoice>,
 }
 
 impl Synth {
@@ -713,7 +800,17 @@ impl Synth {
             click_env: 0.0,
             click_phase: 0.0,
             click_freq: 1000.0,
+            drum_voices: Vec::with_capacity(16),
         }
+    }
+
+    /// Trigger an 808-style drum one-shot (`inst` indexes the kit).
+    pub fn drum_hit(&mut self, inst: u8) {
+        // Advance the shared rng so each hit's noise differs.
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 17;
+        self.rng ^= self.rng << 5;
+        self.drum_voices.push(DrumVoice::new(inst, self.rng));
     }
 
     pub fn set_patch(&mut self, patch: Patch) {
@@ -796,6 +893,16 @@ impl Synth {
         let mut l = l * m;
         let mut r = r * m;
 
+        // Drum voices, mixed centered at a fixed level (independent of the
+        // melodic patch/master).
+        let mut drums = 0.0;
+        for dv in &mut self.drum_voices {
+            drums += dv.render(sr);
+        }
+        self.drum_voices.retain(|v| v.active());
+        l += drums * 0.5;
+        r += drums * 0.5;
+
         // Metronome click: a short decaying sine, mixed in at a fixed level
         // above the patch so the count-in is always audible.
         if self.click_env > 0.0005 {
@@ -849,5 +956,15 @@ mod tests {
         s.note_off(64);
         s.note_off(67);
         run(&mut s, 48_000); // release + reap
+    }
+
+    #[test]
+    fn drums_stay_finite_and_in_range() {
+        let mut s = Synth::new(48_000.0, Arc::new(VoiceMonitor::new()));
+        for inst in 0..7 {
+            s.drum_hit(inst);
+        }
+        run(&mut s, 48_000); // ~1s: all voices decay and reap
+        assert!(s.drum_voices.is_empty(), "drum voices should be reaped");
     }
 }

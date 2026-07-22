@@ -20,6 +20,8 @@ pub enum SynthEvent {
     SetPatch(Patch),
     /// A metronome click (count-in). `accent` marks the downbeat (higher pip).
     Click { accent: bool },
+    /// Trigger an 808-style drum voice (`inst` indexes the drum kit).
+    DrumHit { inst: u8 },
 }
 
 /// Details about the running output stream, shown in the UI.
@@ -84,6 +86,7 @@ where
                     SynthEvent::NoteOff { id } => synth.note_off(id),
                     SynthEvent::SetPatch(patch) => synth.set_patch(patch),
                     SynthEvent::Click { accent } => synth.click(accent),
+                    SynthEvent::DrumHit { inst } => synth.drum_hit(inst),
                 }
             }
 

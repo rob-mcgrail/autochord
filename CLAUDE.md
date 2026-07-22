@@ -11,10 +11,13 @@ edit a full subtractive synth engine — all from the keyboard.
 - `src/app.rs` — all app state, key handling, the latch/lock model, arpeggiator,
   the navigable play-page grid (`sel_row`/`sel_col`), the multitrack loop
   recorder (`LoopSlot`/`Recording`, baked note-tapes on per-source voice ids),
-  the synth editor, and the **text control interface** (`serve`, `state_text`,
-  `apply_command`, and the `Param` key/raw/set_raw machinery).
+  the 808-style drum machine (`DrumInst`/`DrumTrack`, a 16-step sequencer on the
+  shared grid), the synth editor, and the **text control interface** (`serve`,
+  `state_text`, `apply_command`, and the `Param` key/raw/set_raw machinery). The
+  three views (`View::Play|Synth|Drum`) cycle with Tab.
 - `src/synth.rs` — the DSP: oscillators, filter, envelopes, LFOs, voices; the
-  hardcoded `presets()` bank and `Patch::lerp` (for the beat-length patch glide).
+  808-style `DrumVoice` kit; the hardcoded `presets()` bank and `Patch::lerp`
+  (for the beat-length patch glide).
 - `src/audio.rs` — cpal stream + the `SynthEvent` channel to the audio thread.
 - `src/control.rs` — the on-disk text interface (paths, inbox, publishing, CLI).
 - `src/transport.rs` — the shared musical clock (tempo + epoch) across instances.

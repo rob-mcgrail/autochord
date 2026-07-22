@@ -59,6 +59,14 @@ loop2.layer1 C4@0:1 E4@1:1 G4@2:2
 loop2.layer2 C3@0:8
 loop3 empty 0bars 0layers
 loop4 empty 0bars 0layers
+drums.track 1
+drums.on on
+drums.tap off
+drum1.inst kick
+drum1.steps x...x...x...x...
+drum2.inst snare
+drum2.steps ....x.......x...
+...
 patch 0
 patch.name Warm Bloom
 engine subtractive
@@ -142,6 +150,20 @@ clashing. Each slot reads back as `loopN <empty|armed|rec|playing> <bars>bars
 <layers>layers [quantize <q> div <d> speed <s>x transpose <t>] [muted] [solo]`,
 followed by one `loopN.layerK <note@beat:dur> ...` line per layer — the same
 format `define` takes, so loops round-trip through the interface.
+
+### Drum machine
+
+An 808-style 16-step sequencer, 8 tracks, on the shared 16th grid. Kit
+instruments: `kick snare hihat openhat cowbell tom ride`.
+
+- `drums.track <1-8>` — selected track. `drums.on on|off` — sequencer enable.
+  `drums.tap on|off` — tap-record arm. `drums.hit <inst>` — trigger a drum once.
+- `drumN.inst <inst>` — track N's instrument (N = 1..8).
+- `drumN.steps <16 chars>` — track N's pattern; `x`/`1`/`#`/`*` = hit, anything
+  else (e.g. `.`) = rest. e.g. `drum1.steps x...x...x...x...` (four-on-the-floor).
+
+Each track reads back as `drumN.inst <inst>` + `drumN.steps <pattern>`, so beats
+round-trip through the interface.
 
 Unknown keys and unparseable values are ignored. Values are clamped to valid
 ranges.

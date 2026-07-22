@@ -161,6 +161,27 @@ during count-in or the ending bar), bar count, layer count, and a moving
 playhead. Agents can also **author loops directly** over the text interface
 (`loop1 define 1 C4@0:1 E4@1:1 G4@2:2`) and read their notes back — see below.
 
+## Drum machine (Tab again)
+
+A third **Tab** press opens an **808-style step sequencer** — eight tracks of a
+16-step grid, running on the same shared clock (16th notes, so a groove stays
+locked to the arp and loops, across instances).
+
+- **`z`–`m`** live-trigger the seven-piece kit: **kick · snare · hihat · open
+  hat · cowbell · tom · ride**.
+- **Number keys 1–8** select a track (your step position stays put).
+- **`q`–`i`** toggle steps 1–8 of the selected track, **`a`–`k`** steps 9–16.
+- **`,` / `.`** (or `-` / `+`) change the selected track's instrument — so you
+  can stack, say, eight kick tracks for 16ths, or any mix.
+- **Space** arms **tap-record**: hit the `z`–`m` pads in time and they land
+  **quantized** onto the grid (into the first track holding that instrument).
+
+The playhead lights the current column as it sweeps. The whole kit keeps
+grooving while you're on other tabs. Everything is exposed to the text
+interface — `drumN.inst`, `drumN.steps` (a 16-char `x`/`.` pattern),
+`drums.track`, `drums.on`, `drums.tap`, and `drums.hit <inst>` — so agents can
+program beats too.
+
 ## Text control interface (for agents & scripts)
 
 Every running instance is fully **readable and writable as plain text** — no

@@ -190,6 +190,87 @@ struct Recording {
     count_in: Vec<(f64, bool)>,
 }
 
+// ---------------------------------------------------------------------------
+// Drum machine (808-style step sequencer)
+// ---------------------------------------------------------------------------
+
+/// Number of sequencer tracks (rows) and steps per track.
+const DRUM_TRACKS: usize = 8;
+const DRUM_STEPS: usize = 16;
+
+/// The drum kit. The order is the canonical instrument index shared with
+/// `synth::DrumVoice` — do not reorder without matching the synth.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DrumInst {
+    Kick,
+    Snare,
+    Hihat,
+    OpenHat,
+    Cowbell,
+    Tom,
+    Ride,
+}
+
+impl DrumInst {
+    /// In canonical index order — also the live-trigger order on `z`..`m`.
+    const ALL: [DrumInst; 7] = [
+        DrumInst::Kick,
+        DrumInst::Snare,
+        DrumInst::Hihat,
+        DrumInst::OpenHat,
+        DrumInst::Cowbell,
+        DrumInst::Tom,
+        DrumInst::Ride,
+    ];
+
+    fn index(self) -> u8 {
+        DrumInst::ALL.iter().position(|&d| d == self).unwrap_or(0) as u8
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            DrumInst::Kick => "kick",
+            DrumInst::Snare => "snare",
+            DrumInst::Hihat => "hihat",
+            DrumInst::OpenHat => "openhat",
+            DrumInst::Cowbell => "cowbell",
+            DrumInst::Tom => "tom",
+            DrumInst::Ride => "ride",
+        }
+    }
+
+    fn from_label(s: &str) -> Option<DrumInst> {
+        DrumInst::ALL.iter().copied().find(|d| d.label() == s)
+    }
+}
+
+/// One drum track: an instrument assignment and a 16-step on/off pattern.
+#[derive(Clone)]
+struct DrumTrack {
+    inst: DrumInst,
+    steps: [bool; DRUM_STEPS],
+}
+
+/// Default instrument per track (reassignable with `,`/`.`): the seven-piece
+/// kit, with the eighth track a second kick.
+const DRUM_DEFAULTS: [DrumInst; DRUM_TRACKS] = [
+    DrumInst::Kick,
+    DrumInst::Snare,
+    DrumInst::Hihat,
+    DrumInst::OpenHat,
+    DrumInst::Cowbell,
+    DrumInst::Tom,
+    DrumInst::Ride,
+    DrumInst::Kick,
+];
+
+/// Keys that toggle the 16 steps of the selected track: `q`..`i`, then `a`..`k`.
+const DRUM_STEP_KEYS: [char; DRUM_STEPS] = [
+    'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k',
+];
+/// Keys that live-trigger the seven instruments: `z`..`m`.
+const DRUM_TRIGGER_KEYS: [char; 7] = ['z', 'x', 'c', 'v', 'b', 'n', 'm'];
+
 /// Ignore repeated presses of the same chord button within this window, so OS
 /// key-repeat can't rapidly flip a latch on and off.
 const BUTTON_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -269,10 +350,11 @@ struct Held {
 }
 
 /// Which screen is showing.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum View {
     Play,
     Synth,
+    Drum,
 }
 
 /// An editable synth parameter. `usize` selects oscillator 0 or 1.
@@ -697,6 +779,16 @@ pub struct App {
     loops: [LoopSlot; LOOP_SLOTS],
     /// The recording pass in progress, if any (only one at a time).
     rec: Option<Recording>,
+    /// Drum machine: eight tracks of a 16-step sequencer (Drum view).
+    drum_tracks: Vec<DrumTrack>,
+    /// The selected drum track (number keys 1-8; step edits act on it).
+    drum_sel: usize,
+    /// Drum sequencer enabled (plays on the shared 16th grid).
+    drums_on: bool,
+    /// Tap-record armed (Space): drum triggers write quantized into the grid.
+    drum_tap: bool,
+    /// Last drum grid step fired, for edge detection (like the arp).
+    last_drum_step: i64,
     /// Shared clock: tempo + beat grid, synced across instances.
     transport: Transport,
     /// Arpeggiator runtime: pattern position, the note currently sounding, and
@@ -785,6 +877,14 @@ impl App {
             sel_col: 0,
             loops: std::array::from_fn(|_| LoopSlot::default()),
             rec: None,
+            drum_tracks: DRUM_DEFAULTS
+                .iter()
+                .map(|&inst| DrumTrack { inst, steps: [false; DRUM_STEPS] })
+                .collect(),
+            drum_sel: 0,
+            drums_on: true,
+            drum_tap: false,
+            last_drum_step: 0,
             transport,
             arp_pos: 0,
             arp_sounding: None,
@@ -822,12 +922,13 @@ impl App {
             }
         }
 
-        // Tab toggles the synth-editor view (both views).
+        // Tab cycles the views: Play → Synth → Drum → Play.
         if key.code == KeyCode::Tab {
             if key.kind == KeyEventKind::Press {
                 self.view = match self.view {
                     View::Play => View::Synth,
-                    View::Synth => View::Play,
+                    View::Synth => View::Drum,
+                    View::Drum => View::Play,
                 };
             }
             return;
@@ -846,7 +947,15 @@ impl App {
 
         let c = char_of(key.code);
 
-        // Piano trigger keys work in BOTH views ("piano keys stay piano keys").
+        // The Drum view reclaims the whole keyboard (z-m are drum pads, q-i/a-k
+        // are step buttons), so the piano isn't live there.
+        if self.view == View::Drum {
+            self.drum_key(key, c);
+            return;
+        }
+
+        // Piano trigger keys work in the Play and Synth views ("piano keys stay
+        // piano keys").
         if let Some(ch) = c {
             if let Some(root) = note_for_key(ch, self.window) {
                 match key.kind {
@@ -862,6 +971,7 @@ impl App {
         match self.view {
             View::Play => self.play_key(key, c),
             View::Synth => self.synth_key(key, c),
+            View::Drum => {}
         }
     }
 
@@ -969,6 +1079,145 @@ impl App {
             && self.button_debounced(c)
         {
             self.toggle_button(c);
+        }
+    }
+
+    /// Drum-view controls: number keys select a track, `q`-`i`/`a`-`k` toggle
+    /// its 16 steps, `z`-`m` live-trigger the kit, `,`/`.` (or `-`/`+`) change
+    /// the selected track's instrument, and Space arms tap-record.
+    fn drum_key(&mut self, key: KeyEvent, c: Option<char>) {
+        // Up/Down also move the selected track (like the number keys).
+        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            match key.code {
+                KeyCode::Up => {
+                    self.drum_sel = self.drum_sel.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down => {
+                    self.drum_sel = (self.drum_sel + 1).min(DRUM_TRACKS - 1);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let Some(c) = c else {
+            return;
+        };
+
+        // Space: arm/disarm tap-record.
+        if c == ' ' {
+            if key.kind == KeyEventKind::Press && self.button_debounced(' ') {
+                self.drum_tap = !self.drum_tap;
+            }
+            return;
+        }
+
+        // Number keys 1-8: select the track (keeps the step layout in place).
+        if let Some(d) = c.to_digit(10) {
+            if (1..=DRUM_TRACKS as u32).contains(&d) {
+                if key.kind == KeyEventKind::Press {
+                    self.drum_sel = (d - 1) as usize;
+                }
+                return;
+            }
+        }
+
+        // `,`/`.` (or `-`/`+`) cycle the selected track's instrument.
+        if matches!(c, ',' | '<' | '.' | '>' | '-' | '=' | '+') {
+            if key.kind == KeyEventKind::Press && self.button_debounced(c) {
+                let dir = if matches!(c, ',' | '<' | '-') { -1 } else { 1 };
+                self.drum_cycle_inst(dir);
+            }
+            return;
+        }
+
+        // `z`-`m`: live-trigger a drum (and tap it into the grid if armed).
+        if let Some(idx) = DRUM_TRIGGER_KEYS.iter().position(|&k| k == c) {
+            if key.kind == KeyEventKind::Press {
+                self.drum_trigger(idx as u8);
+            }
+            return;
+        }
+
+        // `q`-`i` / `a`-`k`: toggle the selected track's steps.
+        if let Some(step) = DRUM_STEP_KEYS.iter().position(|&k| k == c) {
+            if key.kind == KeyEventKind::Press && self.button_debounced(c) {
+                let t = self.drum_sel;
+                self.drum_tracks[t].steps[step] ^= true;
+            }
+        }
+    }
+
+    /// Set a drum track's instrument or step pattern from the text interface.
+    fn drum_set(&mut self, slot: usize, field: &str, value: &str) {
+        match field {
+            "inst" => {
+                if let Some(inst) = DrumInst::from_label(value) {
+                    self.drum_tracks[slot].inst = inst;
+                }
+            }
+            "steps" => {
+                let mut steps = [false; DRUM_STEPS];
+                for (i, ch) in value.chars().take(DRUM_STEPS).enumerate() {
+                    steps[i] = matches!(ch, 'x' | 'X' | '1' | '#' | '*');
+                }
+                self.drum_tracks[slot].steps = steps;
+            }
+            _ => {}
+        }
+    }
+
+    /// Cycle the selected drum track's instrument by `dir`.
+    fn drum_cycle_inst(&mut self, dir: i32) {
+        let t = self.drum_sel;
+        let cur = DrumInst::ALL
+            .iter()
+            .position(|&d| d == self.drum_tracks[t].inst)
+            .unwrap_or(0) as i32;
+        let n = DrumInst::ALL.len() as i32;
+        self.drum_tracks[t].inst = DrumInst::ALL[(cur + dir).rem_euclid(n) as usize];
+    }
+
+    /// Sound a drum live; if tap-record is armed, write it into the grid at the
+    /// nearest step of the first track carrying that instrument.
+    fn drum_trigger(&mut self, inst_idx: u8) {
+        let _ = self.tx.send(SynthEvent::DrumHit { inst: inst_idx });
+        if self.drum_tap {
+            let step = self.nearest_drum_step();
+            let inst = DrumInst::ALL[inst_idx as usize];
+            if let Some(tr) = self.drum_tracks.iter_mut().find(|tr| tr.inst == inst) {
+                tr.steps[step] = true;
+            }
+        }
+    }
+
+    /// The nearest 16th step index (for quantized tap-record).
+    fn nearest_drum_step(&self) -> usize {
+        let pos = self.transport.step_position(ARP_SUBDIV);
+        (pos.round() as i64).rem_euclid(DRUM_STEPS as i64) as usize
+    }
+
+    /// The current drum grid step (floored) on the shared 16th grid.
+    fn drum_grid_step(&self) -> i64 {
+        self.transport.step_position(ARP_SUBDIV).floor() as i64
+    }
+
+    /// Advance the drum sequencer, firing each track's active step. Runs every
+    /// frame (regardless of view) so a groove keeps playing across tabs.
+    fn tick_drums(&mut self) {
+        let step = self.drum_grid_step();
+        if !self.drums_on {
+            self.last_drum_step = step;
+            return;
+        }
+        if step > self.last_drum_step {
+            self.last_drum_step = step;
+            let idx = step.rem_euclid(DRUM_STEPS as i64) as usize;
+            for tr in &self.drum_tracks {
+                if tr.steps[idx] {
+                    let _ = self.tx.send(SynthEvent::DrumHit { inst: tr.inst.index() });
+                }
+            }
         }
     }
 
@@ -1898,6 +2147,7 @@ impl App {
         self.transport.sync(); // pick up tempo/epoch changes from other instances
         self.update_patch_glide(); // ease the sounding patch toward its target
         self.tick_loops(); // advance loop recording/playback
+        self.tick_drums(); // advance the drum sequencer
 
         // Fallback lead/bass: release the brief one-shot note when its gate lapses.
         if let Some(t) = self.lead_off {
@@ -2004,6 +2254,7 @@ impl App {
         let _ = writeln!(s, "view {}", match self.view {
             View::Play => "play",
             View::Synth => "synth",
+            View::Drum => "drum",
         });
         let _ = writeln!(s, "latch {}", onoff(self.latch));
         let _ = writeln!(s, "tuning {}", if self.just { "just" } else { "et" });
@@ -2070,6 +2321,16 @@ impl App {
                     self.layer_tokens(layer, slot.len_beats)
                 );
             }
+        }
+        // Drum machine: selection/enable/tap, then one line per track with its
+        // instrument and 16-step pattern (`x` = hit, `.` = rest).
+        let _ = writeln!(s, "drums.track {}", self.drum_sel + 1);
+        let _ = writeln!(s, "drums.on {}", onoff(self.drums_on));
+        let _ = writeln!(s, "drums.tap {}", onoff(self.drum_tap));
+        for (i, tr) in self.drum_tracks.iter().enumerate() {
+            let pat: String = tr.steps.iter().map(|&on| if on { 'x' } else { '.' }).collect();
+            let _ = writeln!(s, "drum{}.inst {}", i + 1, tr.inst.label());
+            let _ = writeln!(s, "drum{}.steps {}", i + 1, pat);
         }
         // Selected preset (PgUp/PgDn or the `patch` command).
         let presets = crate::synth::presets();
@@ -2178,6 +2439,20 @@ impl App {
                 }
             }
             "field" => self.select_field(arg),
+            "drums.track" => {
+                if let Ok(n) = arg.parse::<usize>() {
+                    if (1..=DRUM_TRACKS).contains(&n) {
+                        self.drum_sel = n - 1;
+                    }
+                }
+            }
+            "drums.on" => self.drums_on = arg == "on",
+            "drums.tap" => self.drum_tap = arg == "on",
+            "drums.hit" => {
+                if let Some(inst) = DrumInst::from_label(arg) {
+                    let _ = self.tx.send(SynthEvent::DrumHit { inst: inst.index() });
+                }
+            }
             "play" => {
                 if let Some(root) = parse_note(arg) {
                     self.current_locked = false;
@@ -2210,6 +2485,17 @@ impl App {
                             "define" => self.loop_define(slot - 1, &rest[1..]),
                             "layer" => self.loop_layer(slot - 1, &rest[1..]),
                             _ => self.loop_command(slot - 1, arg),
+                        }
+                    }
+                } else if let Some(spec) = other.strip_prefix("drum") {
+                    // drumN.inst / drumN.steps
+                    let mut it2 = spec.splitn(2, '.');
+                    if let (Some(n), Some(field)) = (
+                        it2.next().and_then(|s| s.parse::<usize>().ok()),
+                        it2.next(),
+                    ) {
+                        if (1..=DRUM_TRACKS).contains(&n) {
+                            self.drum_set(n - 1, field, arg);
                         }
                     }
                 } else if let Some(p) = param_by_key(other) {
@@ -2463,6 +2749,22 @@ fn char_of(code: KeyCode) -> Option<char> {
 /// Draw the whole UI: a slim status line, the control readout, then the chord
 /// name and piano at the bottom.
 pub fn render(app: &App, frame: &mut Frame) {
+    // The Drum view is its own full-height screen (no melodic piano).
+    if app.view == View::Drum {
+        let chunks = Layout::vertical([
+            Constraint::Length(1), // status + transport readout
+            Constraint::Length(1), // padding
+            Constraint::Min(1),    // drum grid
+        ])
+        .split(frame.area());
+        let top =
+            Layout::horizontal([Constraint::Min(20), Constraint::Length(34)]).split(chunks[0]);
+        frame.render_widget(status(app), top[0]);
+        frame.render_widget(transport_readout(app), top[1]);
+        render_drums(app, frame, chunks[2]);
+        return;
+    }
+
     let chunks = Layout::vertical([
         Constraint::Length(1), // status + transport readout
         Constraint::Length(1), // padding
@@ -2480,9 +2782,97 @@ pub fn render(app: &App, frame: &mut Frame) {
     match app.view {
         View::Play => frame.render_widget(controls(app), chunks[2]),
         View::Synth => render_synth(app, frame, chunks[2]),
+        View::Drum => {}
     }
     frame.render_widget(chord_name(app), chunks[3]);
     render_piano(app, frame, chunks[4]);
+}
+
+/// The drum machine: eight tracks × 16 steps, the selected track highlighted,
+/// the current step lit as a playhead.
+fn render_drums(app: &App, frame: &mut Frame, area: Rect) {
+    let rows = Layout::vertical([
+        Constraint::Length(1), // header / hints
+        Constraint::Length(1), // step-key hints
+        Constraint::Min(1),    // tracks
+    ])
+    .split(area);
+
+    let tap = if app.drum_tap {
+        Span::styled(
+            " TAP REC ",
+            Style::default().fg(Color::Black).bg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("tap: space", Style::default().fg(Color::DarkGray))
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  1-8 ", Style::default().fg(Color::DarkGray)),
+            Span::styled("track  ", Style::default().fg(Color::Yellow)),
+            Span::styled("q-i/a-k steps · z-m play · ,/. kit    ", Style::default().fg(Color::DarkGray)),
+            tap,
+        ])),
+        rows[0],
+    );
+
+    // Step-key hint row, aligned under the grid columns.
+    let prefix = "            "; // matches the track-row label width
+    let mut hint = vec![Span::raw(prefix.to_string())];
+    for (s, &k) in DRUM_STEP_KEYS.iter().enumerate() {
+        if s % 4 == 0 {
+            hint.push(Span::raw(" "));
+        }
+        hint.push(Span::styled(format!(" {k}"), Style::default().fg(Color::DarkGray)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(hint)), rows[1]);
+
+    frame.render_widget(Paragraph::new(drum_lines(app)), rows[2]);
+}
+
+fn drum_lines(app: &App) -> Vec<Line<'static>> {
+    let step_now = if app.drums_on {
+        Some(app.drum_grid_step().rem_euclid(DRUM_STEPS as i64) as usize)
+    } else {
+        None
+    };
+    let mut lines = Vec::new();
+    for (i, tr) in app.drum_tracks.iter().enumerate() {
+        let selected = i == app.drum_sel;
+        let head = format!(
+            "  {} {} {:<8}",
+            if selected { "▸" } else { " " },
+            i + 1,
+            tr.inst.label()
+        );
+        let head_style = if selected {
+            Style::default().fg(ROOT_COLOR).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let mut spans = vec![Span::styled(head, head_style)];
+        for s in 0..DRUM_STEPS {
+            if s % 4 == 0 {
+                spans.push(Span::raw(" "));
+            }
+            let on = tr.steps[s];
+            let playhead = step_now == Some(s);
+            let glyph = if on { "●" } else { "·" };
+            let style = if playhead {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(if on { ROOT_COLOR } else { Color::DarkGray })
+                    .add_modifier(Modifier::BOLD)
+            } else if on {
+                Style::default().fg(TONE_COLOR).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            spans.push(Span::styled(format!(" {glyph}"), style));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 /// The top-right transport readout: Tempo · Time-Sig · Keyboard. The selected
@@ -2501,7 +2891,7 @@ fn transport_readout(app: &App) -> Paragraph<'static> {
     ];
     let mut spans = Vec::new();
     for (i, cell) in cells.into_iter().enumerate() {
-        let selected = app.sel_row == 0 && app.sel_col == i;
+        let selected = app.view == View::Play && app.sel_row == 0 && app.sel_col == i;
         let style = if selected {
             Style::default().fg(Color::Black).bg(ROOT_COLOR).add_modifier(Modifier::BOLD)
         } else {
@@ -2917,7 +3307,8 @@ fn slider_track(pos: usize, width: usize) -> Vec<Span<'static>> {
 fn status(app: &App) -> Paragraph<'static> {
     let tab = match app.view {
         View::Play => "tab:synth",
-        View::Synth => "SYNTH · tab:play",
+        View::Synth => "SYNTH · tab:drum",
+        View::Drum => "DRUM · tab:play",
     };
     let release = if app.enhanced { "release on" } else { "release fallback" };
     let latch = if app.enhanced && !app.latch { "latch off" } else { "latch on" };
@@ -3793,5 +4184,78 @@ mod tests {
         assert!(s.contains(
             "loop1 playing 2bars 1layers quantize 1/16 div 1/1 speed 1.00x transpose 0 muted"
         ));
+    }
+
+    // --- drum machine ------------------------------------------------------
+
+    // Enter the Drum view (Tab cycles Play -> Synth -> Drum).
+    fn to_drum(a: &mut App) {
+        a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(a.view, View::Drum);
+    }
+
+    #[test]
+    fn drum_step_edit_and_track_select() {
+        let mut a = app();
+        to_drum(&mut a);
+        // Number keys select the track; default track 0 is kick.
+        assert_eq!(a.drum_sel, 0);
+        assert_eq!(a.drum_tracks[0].inst, DrumInst::Kick);
+
+        // q toggles step 0, k toggles step 15, of the selected track.
+        tap(&mut a, 'q');
+        tap(&mut a, 'k');
+        assert!(a.drum_tracks[0].steps[0]);
+        assert!(a.drum_tracks[0].steps[15]);
+        tap(&mut a, 'q'); // toggle back off
+        assert!(!a.drum_tracks[0].steps[0]);
+
+        // Number key 2 selects the second track (snare), leaving track 0 intact.
+        tap(&mut a, '2');
+        assert_eq!(a.drum_sel, 1);
+        tap(&mut a, 'w'); // step 1 on track 1
+        assert!(a.drum_tracks[1].steps[1]);
+    }
+
+    #[test]
+    fn drum_instrument_cycle_and_tap() {
+        let mut a = app();
+        to_drum(&mut a);
+        // ,/. cycle the selected track's instrument.
+        assert_eq!(a.drum_tracks[0].inst, DrumInst::Kick);
+        tap(&mut a, '.');
+        assert_eq!(a.drum_tracks[0].inst, DrumInst::Snare);
+        tap(&mut a, ',');
+        assert_eq!(a.drum_tracks[0].inst, DrumInst::Kick);
+
+        // Space arms tap-record; a live trigger then writes into the grid.
+        tap(&mut a, ' ');
+        assert!(a.drum_tap);
+        // At transport beat ~0, the nearest step is 0. Trigger kick (z).
+        tap(&mut a, 'z');
+        assert!(a.drum_tracks[0].steps[a.nearest_drum_step()]);
+    }
+
+    #[test]
+    fn drum_text_interface_round_trip() {
+        let mut a = app();
+        a.apply_command("drum2.inst cowbell");
+        a.apply_command("drum2.steps x...x...x...x...");
+        assert_eq!(a.drum_tracks[1].inst, DrumInst::Cowbell);
+        assert!(a.drum_tracks[1].steps[0] && a.drum_tracks[1].steps[4]);
+        assert!(!a.drum_tracks[1].steps[1]);
+
+        a.apply_command("drums.track 3");
+        assert_eq!(a.drum_sel, 2);
+        a.apply_command("drums.on off");
+        assert!(!a.drums_on);
+
+        let s = a.state_text();
+        assert!(s.contains("view drum") || s.contains("view play")); // view line present
+        assert!(s.contains("drum2.inst cowbell"));
+        assert!(s.contains("drum2.steps x...x...x...x..."));
+        assert!(s.contains("drums.track 3"));
+        assert!(s.contains("drums.on off"));
     }
 }
