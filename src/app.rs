@@ -16,7 +16,7 @@ use crate::notes::{
 };
 use crate::control::Control;
 use crate::notes::parse_note;
-use crate::synth::{Patch, VoiceMonitor, Wave};
+use crate::synth::{FilterMode, Patch, VoiceMonitor, Wave};
 use crate::transport::Transport;
 
 /// Clamp range for the Chord Voicing dial (clicks either side of neutral).
@@ -431,6 +431,12 @@ enum Param {
     OscFine(usize),
     OscLevel(usize),
     OscPan(usize),
+    OscPw(usize),
+    Sub,
+    Ring,
+    Fm,
+    Sync,
+    Pwm,
     Noise,
     AmpA,
     AmpD,
@@ -439,6 +445,9 @@ enum Param {
     Cutoff,
     Resonance,
     FiltEnvAmt,
+    FMode,
+    FSlope,
+    FKey,
     FiltA,
     FiltD,
     FiltS,
@@ -449,8 +458,15 @@ enum Param {
     FiltLfoDepth,
     Glide,
     Spread,
+    Drift,
+    Drive,
+    Unison,
+    Detune,
     Master,
 }
+
+/// Max unison voices (mirrors `synth::UNISON_MAX`).
+const UNISON_MAX: i32 = 4;
 
 impl Param {
     /// Nudge the parameter in `dir` (±1) within its range and step.
@@ -463,6 +479,12 @@ impl Param {
             Param::OscFine(i) => bump(&mut p.osc[i].fine, 1.0, -100.0, 100.0),
             Param::OscLevel(i) => bump(&mut p.osc[i].level, 0.05, 0.0, 1.0),
             Param::OscPan(i) => bump(&mut p.osc[i].pan, 0.1, -1.0, 1.0),
+            Param::OscPw(i) => bump(&mut p.osc[i].pw, 0.02, 0.02, 0.98),
+            Param::Sub => bump(&mut p.sub, 0.05, 0.0, 1.0),
+            Param::Ring => bump(&mut p.ring, 0.05, 0.0, 1.0),
+            Param::Fm => bump(&mut p.fm, 0.05, 0.0, 1.0),
+            Param::Sync => p.sync = dir > 0,
+            Param::Pwm => bump(&mut p.pwm, 0.05, 0.0, 1.0),
             Param::Noise => bump(&mut p.noise, 0.05, 0.0, 1.0),
             Param::AmpA => bump(&mut p.amp.a, 0.01, 0.001, 4.0),
             Param::AmpD => bump(&mut p.amp.d, 0.01, 0.001, 4.0),
@@ -471,6 +493,9 @@ impl Param {
             Param::Cutoff => p.cutoff = (p.cutoff * 1.12f32.powi(dir)).clamp(20.0, 18000.0),
             Param::Resonance => bump(&mut p.resonance, 0.05, 0.0, 1.0),
             Param::FiltEnvAmt => bump(&mut p.filter_env_amount, 0.05, 0.0, 1.0),
+            Param::FMode => p.filter_mode = p.filter_mode.cycle(dir),
+            Param::FSlope => p.filter_slope = if dir > 0 { 24 } else { 12 },
+            Param::FKey => bump(&mut p.filter_keytrack, 0.1, 0.0, 1.0),
             Param::FiltA => bump(&mut p.filter_env.a, 0.01, 0.001, 4.0),
             Param::FiltD => bump(&mut p.filter_env.d, 0.01, 0.001, 4.0),
             Param::FiltS => bump(&mut p.filter_env.s, 0.05, 0.0, 1.0),
@@ -486,6 +511,10 @@ impl Param {
             Param::FiltLfoDepth => bump(&mut p.filter_lfo_depth, 0.05, 0.0, 1.0),
             Param::Glide => bump(&mut p.glide, 0.01, 0.0, 1.0),
             Param::Spread => bump(&mut p.spread, 0.05, 0.0, 1.0),
+            Param::Drift => bump(&mut p.drift, 0.05, 0.0, 1.0),
+            Param::Drive => bump(&mut p.drive, 0.05, 0.0, 1.0),
+            Param::Unison => p.unison = (p.unison as i32 + dir).clamp(1, UNISON_MAX) as u8,
+            Param::Detune => bump(&mut p.detune, 1.0, 0.0, 50.0),
             Param::Master => bump(&mut p.master, 0.02, 0.0, 0.6),
         }
     }
@@ -498,6 +527,12 @@ impl Param {
             Param::OscFine(i) => format!("{:+}c", p.osc[i].fine as i32),
             Param::OscLevel(i) => pct(p.osc[i].level),
             Param::OscPan(i) => pan_str(p.osc[i].pan),
+            Param::OscPw(i) => pct(p.osc[i].pw),
+            Param::Sub => pct(p.sub),
+            Param::Ring => pct(p.ring),
+            Param::Fm => pct(p.fm),
+            Param::Sync => onoff(p.sync).to_string(),
+            Param::Pwm => pct(p.pwm),
             Param::Noise => pct(p.noise),
             Param::AmpA => secs(p.amp.a),
             Param::AmpD => secs(p.amp.d),
@@ -506,6 +541,9 @@ impl Param {
             Param::Cutoff => hz(p.cutoff),
             Param::Resonance => pct(p.resonance),
             Param::FiltEnvAmt => pct(p.filter_env_amount),
+            Param::FMode => p.filter_mode.label().to_string(),
+            Param::FSlope => format!("{}dB", p.filter_slope),
+            Param::FKey => pct(p.filter_keytrack),
             Param::FiltA => secs(p.filter_env.a),
             Param::FiltD => secs(p.filter_env.d),
             Param::FiltS => pct(p.filter_env.s),
@@ -528,6 +566,16 @@ impl Param {
                     pct(p.spread)
                 }
             }
+            Param::Drift => pct(p.drift),
+            Param::Drive => {
+                if p.drive <= 0.0 {
+                    "off".to_string()
+                } else {
+                    pct(p.drive)
+                }
+            }
+            Param::Unison => format!("{}", p.unison),
+            Param::Detune => format!("{}c", p.detune as i32),
             Param::Master => pct(p.master / 0.6),
         }
     }
@@ -546,6 +594,12 @@ impl Param {
             Param::OscFine(i) => format!("osc{}.fine", i + 1),
             Param::OscLevel(i) => format!("osc{}.level", i + 1),
             Param::OscPan(i) => format!("osc{}.pan", i + 1),
+            Param::OscPw(i) => format!("osc{}.pw", i + 1),
+            Param::Sub => "sub".into(),
+            Param::Ring => "ring".into(),
+            Param::Fm => "fm".into(),
+            Param::Sync => "sync".into(),
+            Param::Pwm => "pwm".into(),
             Param::Noise => "noise".into(),
             Param::AmpA => "amp.attack".into(),
             Param::AmpD => "amp.decay".into(),
@@ -554,6 +608,9 @@ impl Param {
             Param::Cutoff => "filter.cutoff".into(),
             Param::Resonance => "filter.reso".into(),
             Param::FiltEnvAmt => "filter.env".into(),
+            Param::FMode => "filter.mode".into(),
+            Param::FSlope => "filter.slope".into(),
+            Param::FKey => "filter.keytrack".into(),
             Param::FiltA => "filterenv.attack".into(),
             Param::FiltD => "filterenv.decay".into(),
             Param::FiltS => "filterenv.sustain".into(),
@@ -564,6 +621,10 @@ impl Param {
             Param::FiltLfoDepth => "filterlfo.depth".into(),
             Param::Glide => "glide".into(),
             Param::Spread => "spread".into(),
+            Param::Drift => "drift".into(),
+            Param::Drive => "drive".into(),
+            Param::Unison => "unison".into(),
+            Param::Detune => "detune".into(),
             Param::Master => "master".into(),
         }
     }
@@ -576,6 +637,12 @@ impl Param {
             Param::OscFine(i) => format!("{}", p.osc[i].fine as i32),
             Param::OscLevel(i) => format!("{:.2}", p.osc[i].level),
             Param::OscPan(i) => format!("{:.2}", p.osc[i].pan),
+            Param::OscPw(i) => format!("{:.2}", p.osc[i].pw),
+            Param::Sub => format!("{:.2}", p.sub),
+            Param::Ring => format!("{:.2}", p.ring),
+            Param::Fm => format!("{:.2}", p.fm),
+            Param::Sync => onoff(p.sync).to_string(),
+            Param::Pwm => format!("{:.2}", p.pwm),
             Param::Noise => format!("{:.2}", p.noise),
             Param::AmpA => format!("{:.3}", p.amp.a),
             Param::AmpD => format!("{:.3}", p.amp.d),
@@ -584,6 +651,9 @@ impl Param {
             Param::Cutoff => format!("{:.0}", p.cutoff),
             Param::Resonance => format!("{:.2}", p.resonance),
             Param::FiltEnvAmt => format!("{:.2}", p.filter_env_amount),
+            Param::FMode => p.filter_mode.label().to_string(),
+            Param::FSlope => format!("{}", p.filter_slope),
+            Param::FKey => format!("{:.2}", p.filter_keytrack),
             Param::FiltA => format!("{:.3}", p.filter_env.a),
             Param::FiltD => format!("{:.3}", p.filter_env.d),
             Param::FiltS => format!("{:.2}", p.filter_env.s),
@@ -594,30 +664,56 @@ impl Param {
             Param::FiltLfoDepth => format!("{:.2}", p.filter_lfo_depth),
             Param::Glide => format!("{:.3}", p.glide),
             Param::Spread => format!("{:.2}", p.spread),
+            Param::Drift => format!("{:.2}", p.drift),
+            Param::Drive => format!("{:.2}", p.drive),
+            Param::Unison => format!("{}", p.unison),
+            Param::Detune => format!("{:.0}", p.detune),
             Param::Master => format!("{:.2}", p.master),
         }
     }
 
     /// Set from a raw string (control interface); returns false if unparseable.
     fn set_raw(self, p: &mut Patch, v: &str) -> bool {
-        if let Param::OscWave(i) = self {
-            p.osc[i].wave = match v {
-                "sine" => Wave::Sine,
-                "tri" | "triangle" => Wave::Triangle,
-                "sqr" | "square" => Wave::Square,
-                _ => return false,
-            };
-            return true;
+        // Discrete params take words, not numbers — handle them first.
+        match self {
+            Param::OscWave(i) => {
+                p.osc[i].wave = match v {
+                    "sine" => Wave::Sine,
+                    "tri" | "triangle" => Wave::Triangle,
+                    "sqr" | "square" => Wave::Square,
+                    _ => return false,
+                };
+                return true;
+            }
+            Param::Sync => {
+                p.sync = matches!(v, "on" | "true" | "1");
+                return true;
+            }
+            Param::FMode => {
+                p.filter_mode = match v {
+                    "lp" => FilterMode::Lp,
+                    "hp" => FilterMode::Hp,
+                    "bp" => FilterMode::Bp,
+                    _ => return false,
+                };
+                return true;
+            }
+            _ => {}
         }
         let Ok(x) = v.parse::<f32>() else {
             return false;
         };
         match self {
-            Param::OscWave(_) => {}
+            Param::OscWave(_) | Param::Sync | Param::FMode => {}
             Param::OscPitch(i) => p.osc[i].pitch = x.clamp(-24.0, 24.0),
             Param::OscFine(i) => p.osc[i].fine = x.clamp(-100.0, 100.0),
             Param::OscLevel(i) => p.osc[i].level = x.clamp(0.0, 1.0),
             Param::OscPan(i) => p.osc[i].pan = x.clamp(-1.0, 1.0),
+            Param::OscPw(i) => p.osc[i].pw = x.clamp(0.02, 0.98),
+            Param::Sub => p.sub = x.clamp(0.0, 1.0),
+            Param::Ring => p.ring = x.clamp(0.0, 1.0),
+            Param::Fm => p.fm = x.clamp(0.0, 1.0),
+            Param::Pwm => p.pwm = x.clamp(0.0, 1.0),
             Param::Noise => p.noise = x.clamp(0.0, 1.0),
             Param::AmpA => p.amp.a = x.clamp(0.001, 4.0),
             Param::AmpD => p.amp.d = x.clamp(0.001, 4.0),
@@ -626,6 +722,8 @@ impl Param {
             Param::Cutoff => p.cutoff = x.clamp(20.0, 18000.0),
             Param::Resonance => p.resonance = x.clamp(0.0, 1.0),
             Param::FiltEnvAmt => p.filter_env_amount = x.clamp(0.0, 1.0),
+            Param::FSlope => p.filter_slope = if x >= 18.0 { 24 } else { 12 },
+            Param::FKey => p.filter_keytrack = x.clamp(0.0, 1.0),
             Param::FiltA => p.filter_env.a = x.clamp(0.001, 4.0),
             Param::FiltD => p.filter_env.d = x.clamp(0.001, 4.0),
             Param::FiltS => p.filter_env.s = x.clamp(0.0, 1.0),
@@ -636,6 +734,10 @@ impl Param {
             Param::FiltLfoDepth => p.filter_lfo_depth = x.clamp(0.0, 1.0),
             Param::Glide => p.glide = x.clamp(0.0, 1.0),
             Param::Spread => p.spread = x.clamp(0.0, 1.0),
+            Param::Drift => p.drift = x.clamp(0.0, 1.0),
+            Param::Drive => p.drive = x.clamp(0.0, 1.0),
+            Param::Unison => p.unison = (x.round() as i32).clamp(1, UNISON_MAX) as u8,
+            Param::Detune => p.detune = x.clamp(0.0, 50.0),
             Param::Master => p.master = x.clamp(0.0, 0.6),
         }
         true
@@ -699,8 +801,8 @@ enum Item {
     P(&'static str, Param),
 }
 
-/// The synth editor laid out in three columns.
-fn synth_columns() -> [Vec<Item>; 3] {
+/// The synth editor laid out in four columns.
+fn synth_columns() -> [Vec<Item>; 4] {
     use Param::*;
     [
         vec![
@@ -708,27 +810,39 @@ fn synth_columns() -> [Vec<Item>; 3] {
             Item::P("wave", OscWave(0)),
             Item::P("pitch", OscPitch(0)),
             Item::P("fine", OscFine(0)),
+            Item::P("width", OscPw(0)),
             Item::P("level", OscLevel(0)),
             Item::P("pan", OscPan(0)),
             Item::Head("OSC 2"),
             Item::P("wave", OscWave(1)),
             Item::P("pitch", OscPitch(1)),
             Item::P("fine", OscFine(1)),
+            Item::P("width", OscPw(1)),
             Item::P("level", OscLevel(1)),
             Item::P("pan", OscPan(1)),
-            Item::Head("NOISE"),
-            Item::P("level", Noise),
         ],
         vec![
+            Item::Head("MIX / MOD"),
+            Item::P("sub", Sub),
+            Item::P("ring", Ring),
+            Item::P("fm", Fm),
+            Item::P("sync", Sync),
+            Item::P("pwm", Pwm),
+            Item::P("noise", Noise),
             Item::Head("AMP ENV"),
             Item::P("attack", AmpA),
             Item::P("decay", AmpD),
             Item::P("sustain", AmpS),
             Item::P("release", AmpR),
+        ],
+        vec![
             Item::Head("FILTER"),
             Item::P("cutoff", Cutoff),
             Item::P("reso", Resonance),
             Item::P("env amt", FiltEnvAmt),
+            Item::P("mode", FMode),
+            Item::P("slope", FSlope),
+            Item::P("keytrk", FKey),
             Item::Head("FILTER ENV"),
             Item::P("attack", FiltA),
             Item::P("decay", FiltD),
@@ -745,6 +859,10 @@ fn synth_columns() -> [Vec<Item>; 3] {
             Item::Head("GLOBAL"),
             Item::P("glide", Glide),
             Item::P("spread", Spread),
+            Item::P("drift", Drift),
+            Item::P("drive", Drive),
+            Item::P("unison", Unison),
+            Item::P("detune", Detune),
             Item::P("volume", Master),
         ],
     ]
@@ -3139,7 +3257,7 @@ fn render_synth(app: &App, frame: &mut Frame, area: Rect) {
     .split(area);
     frame.render_widget(patch_header(app), rows[0]);
     let cols = synth_columns();
-    let areas = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(rows[2]);
+    let areas = Layout::horizontal([Constraint::Ratio(1, 4); 4]).split(rows[2]);
     for (ci, items) in cols.iter().enumerate() {
         frame.render_widget(Paragraph::new(synth_column_lines(app, ci, items)), areas[ci]);
     }
@@ -4089,6 +4207,20 @@ mod tests {
         a.apply_command("subtractive.osc1.wave sqr");
         assert_eq!(a.patch.osc[0].wave, Wave::Square);
 
+        // New character params round-trip (including the discrete ones).
+        a.apply_command("subtractive.sync on");
+        assert!(a.patch.sync);
+        a.apply_command("subtractive.filter.mode hp");
+        assert_eq!(a.patch.filter_mode, FilterMode::Hp);
+        a.apply_command("subtractive.filter.slope 24");
+        assert_eq!(a.patch.filter_slope, 24);
+        a.apply_command("subtractive.unison 3");
+        assert_eq!(a.patch.unison, 3);
+        a.apply_command("subtractive.drift 0.5");
+        assert!((a.patch.drift - 0.5).abs() < 1e-6);
+        a.apply_command("subtractive.osc1.pw 0.3");
+        assert!((a.patch.osc[0].pw - 0.3).abs() < 1e-6);
+
         a.apply_command("play C4");
         assert_eq!(root(&a), 60);
 
@@ -4105,6 +4237,10 @@ mod tests {
         assert!(s.contains("engine subtractive"));
         assert!(s.contains("subtractive.filter.cutoff 3000"));
         assert!(s.contains("subtractive.osc1.wave sqr"));
+        assert!(s.contains("subtractive.sync on"));
+        assert!(s.contains("subtractive.filter.mode hp"));
+        assert!(s.contains("subtractive.filter.slope 24"));
+        assert!(s.contains("subtractive.unison 3"));
 
         // Preset selection by index and by name.
         a.apply_command("patch 3");

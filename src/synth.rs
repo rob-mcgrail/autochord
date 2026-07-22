@@ -74,18 +74,44 @@ impl Wave {
         ALL[(i + dir).rem_euclid(3) as usize]
     }
 
-    fn sample(self, phase: f32, dt: f32) -> f32 {
+    fn sample(self, phase: f32, dt: f32, pw: f32) -> f32 {
         match self {
             Wave::Sine => (phase * TAU).sin(),
             Wave::Triangle => 1.0 - 4.0 * (phase - 0.5).abs(),
             Wave::Square => {
-                // Naive square + PolyBLEP at both edges to tame aliasing.
-                let mut s = if phase < 0.5 { 1.0 } else { -1.0 };
-                s += poly_blep(phase, dt);
-                s -= poly_blep((phase + 0.5).rem_euclid(1.0), dt);
+                // Pulse wave at duty `pw` + PolyBLEP at both edges (anti-alias).
+                let pw = pw.clamp(0.02, 0.98);
+                let mut s = if phase < pw { 1.0 } else { -1.0 };
+                s += poly_blep(phase, dt); // rising edge at 0
+                s -= poly_blep((phase - pw).rem_euclid(1.0), dt); // falling edge at pw
                 s
             }
         }
+    }
+}
+
+/// Resonant filter response the SVF taps.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum FilterMode {
+    #[default]
+    Lp,
+    Hp,
+    Bp,
+}
+
+impl FilterMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            FilterMode::Lp => "lp",
+            FilterMode::Hp => "hp",
+            FilterMode::Bp => "bp",
+        }
+    }
+
+    pub fn cycle(self, dir: i32) -> FilterMode {
+        const ALL: [FilterMode; 3] = [FilterMode::Lp, FilterMode::Hp, FilterMode::Bp];
+        let i = ALL.iter().position(|&m| m == self).unwrap_or(0) as i32;
+        ALL[(i + dir).rem_euclid(3) as usize]
     }
 }
 
@@ -112,6 +138,7 @@ pub struct Osc {
     pub fine: f32,  // fine detune in cents (±100 = ±1 semitone)
     pub level: f32, // 0..1
     pub pan: f32,   // -1 (L) .. +1 (R)
+    pub pw: f32,    // pulse width for the square wave (0.02..0.98)
 }
 
 /// Attack / Decay / Sustain / Release (times in seconds, sustain a 0..1 level).
@@ -142,6 +169,19 @@ pub struct Patch {
     /// per-note pan; the synth just honours the pan it's handed.
     pub spread: f32,
     pub master: f32,
+    // --- character / extras ---
+    pub sub: f32,   // sub-oscillator level (square, one octave below osc1)
+    pub ring: f32,  // ring-modulation depth (osc1 × osc2 mixed in)
+    pub fm: f32,    // osc1 → osc2 frequency-modulation depth
+    pub sync: bool, // hard-sync osc2 to osc1
+    pub pwm: f32,   // pulse-width-modulation LFO depth (0..1)
+    pub drift: f32, // analog drift: slow per-voice pitch wander + jitter (0..1)
+    pub drive: f32, // output soft-saturation (0..1)
+    pub filter_mode: FilterMode,
+    pub filter_slope: u8,      // 12 or 24 dB/oct
+    pub filter_keytrack: f32,  // cutoff follows pitch (0..1)
+    pub unison: u8,            // detuned voices per note (1..UNISON_MAX)
+    pub detune: f32,           // unison detune spread in cents
 }
 
 impl Patch {
@@ -158,6 +198,7 @@ impl Patch {
             fine: f(a.osc[i].fine, b.osc[i].fine),
             level: f(a.osc[i].level, b.osc[i].level),
             pan: f(a.osc[i].pan, b.osc[i].pan),
+            pw: f(a.osc[i].pw, b.osc[i].pw),
         };
         let env = |x: &Adsr, y: &Adsr| Adsr {
             a: f(x.a, y.a),
@@ -180,6 +221,18 @@ impl Patch {
             glide: f(a.glide, b.glide),
             spread: f(a.spread, b.spread),
             master: f(a.master, b.master),
+            sub: f(a.sub, b.sub),
+            ring: f(a.ring, b.ring),
+            fm: f(a.fm, b.fm),
+            sync: b.sync, // discrete — snap
+            pwm: f(a.pwm, b.pwm),
+            drift: f(a.drift, b.drift),
+            drive: f(a.drive, b.drive),
+            filter_mode: b.filter_mode, // discrete — snap
+            filter_slope: b.filter_slope,
+            filter_keytrack: f(a.filter_keytrack, b.filter_keytrack),
+            unison: b.unison, // discrete — snap
+            detune: f(a.detune, b.detune),
         }
     }
 }
@@ -188,8 +241,8 @@ impl Default for Patch {
     fn default() -> Self {
         Self {
             osc: [
-                Osc { wave: Wave::Triangle, pitch: 0.0, fine: 0.0, level: 0.6, pan: -0.25 },
-                Osc { wave: Wave::Sine, pitch: 0.0, fine: 0.0, level: 0.5, pan: 0.25 },
+                Osc { wave: Wave::Triangle, pitch: 0.0, fine: 0.0, level: 0.6, pan: -0.25, pw: 0.5 },
+                Osc { wave: Wave::Sine, pitch: 0.0, fine: 0.0, level: 0.5, pan: 0.25, pw: 0.5 },
             ],
             noise: 0.0,
             amp: Adsr { a: 0.01, d: 0.2, s: 0.8, r: 0.35 },
@@ -204,6 +257,18 @@ impl Default for Patch {
             glide: 0.0,
             spread: 0.0,
             master: 0.16,
+            sub: 0.0,
+            ring: 0.0,
+            fm: 0.0,
+            sync: false,
+            pwm: 0.0,
+            drift: 0.12, // a touch of analog wander by default
+            drive: 0.0,
+            filter_mode: FilterMode::Lp,
+            filter_slope: 12,
+            filter_keytrack: 0.0,
+            unison: 1,
+            detune: 12.0,
         }
     }
 }
@@ -219,7 +284,7 @@ pub const PRESET_COUNT: usize = 24;
 /// character comes from detune, filter movement, envelope shape, and spread.
 pub fn presets() -> [(&'static str, Patch); PRESET_COUNT] {
     fn osc(wave: Wave, pitch: f32, fine: f32, level: f32, pan: f32) -> Osc {
-        Osc { wave, pitch, fine, level, pan }
+        Osc { wave, pitch, fine, level, pan, pw: 0.5 }
     }
     fn adsr(a: f32, d: f32, s: f32, r: f32) -> Adsr {
         Adsr { a, d, s, r }
@@ -518,27 +583,31 @@ impl Env {
     }
 
     fn next(&mut self, adsr: &Adsr, sr: f32) -> f32 {
-        let per = |t: f32| 1.0 / (t.max(0.0005) * sr);
+        // Exponential (analog-style) curves: each stage approaches a target
+        // with a one-pole coefficient, so attacks round off and decays/releases
+        // taper like a real envelope rather than a straight ramp.
+        let coeff = |t: f32| 1.0 - (-1.0 / (t.max(0.0005) * sr)).exp();
         match self.stage {
             Stage::Idle => {}
             Stage::Attack => {
-                self.level += per(adsr.a);
+                // Aim past 1.0 so the approach reaches full in finite time.
+                self.level += (1.3 - self.level) * coeff(adsr.a);
                 if self.level >= 1.0 {
                     self.level = 1.0;
                     self.stage = Stage::Decay;
                 }
             }
             Stage::Decay => {
-                self.level -= per(adsr.d) * (1.0 - adsr.s);
-                if self.level <= adsr.s {
+                self.level += (adsr.s - self.level) * coeff(adsr.d);
+                if (self.level - adsr.s).abs() < 0.001 {
                     self.level = adsr.s;
                     self.stage = Stage::Sustain;
                 }
             }
             Stage::Sustain => self.level = adsr.s,
             Stage::Release => {
-                self.level -= per(adsr.r);
-                if self.level <= 0.0 {
+                self.level += (0.0 - self.level) * coeff(adsr.r);
+                if self.level <= 0.0005 {
                     self.level = 0.0;
                     self.stage = Stage::Idle;
                 }
@@ -556,25 +625,38 @@ struct Svf {
 }
 
 impl Svf {
-    fn lowpass(&mut self, input: f32, a1: f32, a2: f32, a3: f32) -> f32 {
+    /// Process one sample, returning `(lowpass, bandpass, highpass)`.
+    fn process(&mut self, input: f32, a1: f32, a2: f32, a3: f32, k: f32) -> (f32, f32, f32) {
         let v3 = input - self.ic2;
         let v1 = a1 * self.ic1 + a2 * v3;
         let v2 = self.ic2 + a2 * self.ic1 + a3 * v3;
         self.ic1 = 2.0 * v1 - self.ic1;
         self.ic2 = 2.0 * v2 - self.ic2;
-        v2
+        let lp = v2;
+        let bp = v1;
+        let hp = input - k * v1 - v2;
+        (lp, bp, hp)
+    }
+
+    fn run(&mut self, input: f32, mode: FilterMode, a1: f32, a2: f32, a3: f32, k: f32) -> f32 {
+        let (lp, bp, hp) = self.process(input, a1, a2, a3, k);
+        match mode {
+            FilterMode::Lp => lp,
+            FilterMode::Bp => bp,
+            FilterMode::Hp => hp,
+        }
     }
 }
 
-/// SVF coefficients `(a1, a2, a3)` for a cutoff and resonance.
-fn svf_coeffs(cutoff: f32, resonance: f32, sr: f32) -> (f32, f32, f32) {
+/// SVF coefficients `(a1, a2, a3, k)` for a cutoff and resonance (`k = 1/Q`).
+fn svf_coeffs(cutoff: f32, resonance: f32, sr: f32) -> (f32, f32, f32, f32) {
     let g = (PI * cutoff / sr).tan();
     let q = 0.5 + resonance.clamp(0.0, 1.0) * 9.5;
     let k = 1.0 / q;
     let a1 = 1.0 / (1.0 + g * (g + k));
     let a2 = g * a1;
     let a3 = g * a2;
-    (a1, a2, a3)
+    (a1, a2, a3, k)
 }
 
 /// Equal-power pan gains for L/R.
@@ -583,37 +665,69 @@ fn pan_gains(pan: f32) -> (f32, f32) {
     (angle.cos(), angle.sin())
 }
 
-/// One sounding note: two oscillators + noise, amp & filter envelopes, and a
-/// stereo pair of filters (so per-oscillator panning survives filtering).
+/// Maximum unison voices stacked per note.
+const UNISON_MAX: usize = 4;
+
+/// One sounding note: two oscillators (each optionally unison-stacked) + sub +
+/// noise, amp & filter envelopes, and a stereo pair of (optionally cascaded)
+/// filters. Carries small per-voice analog imperfections (start phase, drift,
+/// jitter) so no two notes are bit-identical.
 struct Voice {
     /// Voice key: high byte = source (0 live, 1..=N loop slots), low byte = MIDI
     /// note. Namespacing by source lets layered loops sound the same pitch on
     /// independent voices without stomping each other's note-offs or envelopes.
     id: u16,
-    freq: f32,  // target base frequency
-    glide: f32, // current base frequency (portamentos toward `freq`)
+    freq: f32,   // target base frequency
+    glide: f32,  // current base frequency (portamentos toward `freq`)
     spread: f32, // stereo-spread pan offset (-1..1), from note position in the chord
-    phase1: f32,
-    phase2: f32,
+    phase1: [f32; UNISON_MAX],
+    phase2: [f32; UNISON_MAX],
+    sub_phase: f32,
     amp: Env,
     filt: Env,
     left: Svf,
     right: Svf,
+    left2: Svf,  // second stage for the 24 dB slope
+    right2: Svf,
+    drift: f32,     // smoothed per-voice pitch wander (semitone units, ×patch.drift)
+    drift_rng: u32, // per-voice noise source for drift
+    jit_cut: f32,   // fixed per-voice cutoff jitter unit (-1..1)
+    jit_lvl: f32,   // fixed per-voice level jitter unit (-1..1)
 }
 
 impl Voice {
-    fn new(id: u16, freq: f32) -> Self {
+    fn new(id: u16, freq: f32, seed: u32) -> Self {
+        // Randomize start phases and jitter so voices aren't identical.
+        let mut rng = seed | 1;
+        let unit = |rng: &mut u32| white(rng); // -1..1
+        let unit01 = |rng: &mut u32| (white(rng) + 1.0) * 0.5; // 0..1
+        let mut phase1 = [0.0; UNISON_MAX];
+        let mut phase2 = [0.0; UNISON_MAX];
+        for i in 0..UNISON_MAX {
+            phase1[i] = unit01(&mut rng);
+            phase2[i] = unit01(&mut rng);
+        }
+        let sub_phase = unit01(&mut rng);
+        let jit_cut = unit(&mut rng);
+        let jit_lvl = unit(&mut rng);
         Self {
             id,
             freq,
             glide: freq,
             spread: 0.0,
-            phase1: 0.0,
-            phase2: 0.0,
+            phase1,
+            phase2,
+            sub_phase,
             amp: Env::new(),
             filt: Env::new(),
             left: Svf::default(),
             right: Svf::default(),
+            left2: Svf::default(),
+            right2: Svf::default(),
+            drift: 0.0,
+            drift_rng: rng ^ 0x9E37_79B9,
+            jit_cut,
+            jit_lvl,
         }
     }
 
@@ -628,7 +742,15 @@ impl Voice {
         self.filt.gate_off();
     }
 
-    fn render(&mut self, p: &Patch, pitch_lfo: f32, filt_lfo: f32, noise: f32, sr: f32) -> (f32, f32) {
+    fn render(
+        &mut self,
+        p: &Patch,
+        pitch_lfo: f32,
+        filt_lfo: f32,
+        pwm_lfo: f32,
+        noise: f32,
+        sr: f32,
+    ) -> (f32, f32) {
         let amp = self.amp.next(&p.amp, sr);
         let fenv = self.filt.next(&p.filter_env, sr);
 
@@ -640,36 +762,111 @@ impl Voice {
             self.glide = self.freq;
         }
 
-        let plfo = pitch_lfo * p.pitch_lfo_depth; // semitones of vibrato
-        let o1 = run_osc(&p.osc[0], &mut self.phase1, plfo, self.glide, sr);
-        let o2 = run_osc(&p.osc[1], &mut self.phase2, plfo, self.glide, sr);
-        // Stereo-spread the whole voice on top of each oscillator's own pan.
+        // Analog drift: a slowly wandering per-voice pitch offset (semitones).
+        let drift_semis = if p.drift > 0.0 {
+            let k = 1.0 / (0.25 * sr);
+            self.drift += (white(&mut self.drift_rng) - self.drift) * k;
+            self.drift * p.drift
+        } else {
+            0.0
+        };
+        let plfo = pitch_lfo * p.pitch_lfo_depth + drift_semis; // semitones
+        let pw_mod = pwm_lfo * p.pwm * 0.45;
+        let base = self.glide;
+        let uni = (p.unison.clamp(1, UNISON_MAX as u8)) as usize;
+        let uni_gain = 1.0 / (uni as f32).sqrt();
+
+        let mut o1 = 0.0;
+        let mut o2 = 0.0;
+        for i in 0..uni {
+            let det = unison_cents(i, uni, p.detune) / 100.0; // semitones
+            // Oscillator 1.
+            let s1 = p.osc[0].pitch + p.osc[0].fine / 100.0 + det + plfo;
+            let f1 = base * 2f32.powf(s1 / 12.0);
+            let dt1 = (f1 / sr).clamp(0.0, 0.49);
+            let pw1 = (p.osc[0].pw + pw_mod).clamp(0.02, 0.98);
+            let v1 = p.osc[0].wave.sample(self.phase1[i], dt1, pw1);
+            let prev = self.phase1[i];
+            self.phase1[i] = (self.phase1[i] + dt1).fract();
+            let wrapped = self.phase1[i] < prev;
+            o1 += v1;
+            // Oscillator 2 — optionally FM'd by osc1 and hard-synced to it.
+            if p.sync && wrapped {
+                self.phase2[i] = 0.0;
+            }
+            let fm = v1 * p.fm * 12.0; // exponential FM, up to ±12 semitones
+            let s2 = p.osc[1].pitch + p.osc[1].fine / 100.0 + det + plfo + fm;
+            let f2 = base * 2f32.powf(s2 / 12.0);
+            let dt2 = (f2 / sr).clamp(0.0, 0.49);
+            let pw2 = (p.osc[1].pw + pw_mod).clamp(0.02, 0.98);
+            let v2 = p.osc[1].wave.sample(self.phase2[i], dt2, pw2);
+            self.phase2[i] = (self.phase2[i] + dt2).fract();
+            o2 += v2;
+        }
+        o1 *= uni_gain * p.osc[0].level;
+        o2 *= uni_gain * p.osc[1].level;
+
+        // Sub-oscillator: a square an octave below the base.
+        let sub = if p.sub > 0.0 {
+            let dt = (base * 0.5 / sr).clamp(0.0, 0.49);
+            let s = Wave::Square.sample(self.sub_phase, dt, 0.5) * p.sub;
+            self.sub_phase = (self.sub_phase + dt).fract();
+            s
+        } else {
+            0.0
+        };
+        let ring = o1 * o2 * p.ring; // ring modulation
+        let n = noise * p.noise * FRAC_1_SQRT_2;
+
+        // Stereo-place: oscillators by their own pan (+ chord spread); the
+        // centered signals (sub/ring/noise) just take the spread.
         let (l1, r1) = pan_gains((p.osc[0].pan + self.spread).clamp(-1.0, 1.0));
         let (l2, r2) = pan_gains((p.osc[1].pan + self.spread).clamp(-1.0, 1.0));
-        let n = noise * p.noise * FRAC_1_SQRT_2;
-        let mut l = o1 * l1 + o2 * l2 + n;
-        let mut r = o1 * r1 + o2 * r2 + n;
+        let (lc, rc) = pan_gains(self.spread.clamp(-1.0, 1.0));
+        let center = sub + ring + n;
+        let mut l = o1 * l1 + o2 * l2 + center * lc;
+        let mut r = o1 * r1 + o2 * r2 + center * rc;
 
-        // Cutoff: base, swept up by the filter envelope, wobbled by its LFO.
+        // Cutoff: base × key-tracking × per-voice jitter × env sweep × LFO.
+        let keytrack = if p.filter_keytrack > 0.0 {
+            2f32.powf(p.filter_keytrack * (self.freq / 261.63).log2())
+        } else {
+            1.0
+        };
         let cutoff = (p.cutoff
+            * keytrack
+            * 2f32.powf(self.jit_cut * p.drift * 0.3)
             * 2f32.powf(p.filter_env_amount * fenv * 4.0)
             * 2f32.powf(filt_lfo * p.filter_lfo_depth * 2.0))
         .clamp(20.0, sr * 0.45);
-        let (a1, a2, a3) = svf_coeffs(cutoff, p.resonance, sr);
-        l = self.left.lowpass(l, a1, a2, a3);
-        r = self.right.lowpass(r, a1, a2, a3);
+        let (a1, a2, a3, k) = svf_coeffs(cutoff, p.resonance, sr);
+        l = self.left.run(l, p.filter_mode, a1, a2, a3, k);
+        r = self.right.run(r, p.filter_mode, a1, a2, a3, k);
+        if p.filter_slope >= 24 {
+            l = self.left2.run(l, p.filter_mode, a1, a2, a3, k);
+            r = self.right2.run(r, p.filter_mode, a1, a2, a3, k);
+        }
 
-        (l * amp, r * amp)
+        // Optional soft-saturation drive.
+        if p.drive > 0.0 {
+            let g = 1.0 + p.drive * 4.0;
+            l = (l * g).tanh();
+            r = (r * g).tanh();
+        }
+
+        let vamp = amp * (1.0 + self.jit_lvl * p.drift * 0.15);
+        (l * vamp, r * vamp)
     }
 }
 
-fn run_osc(osc: &Osc, phase: &mut f32, pitch_lfo: f32, base_freq: f32, sr: f32) -> f32 {
-    let semis = osc.pitch + osc.fine / 100.0 + pitch_lfo;
-    let freq = base_freq * 2f32.powf(semis / 12.0);
-    let dt = freq / sr;
-    let s = osc.wave.sample(*phase, dt) * osc.level;
-    *phase = (*phase + dt).fract();
-    s
+/// Symmetric unison detune in cents for copy `i` of `n` (0 for a single voice).
+fn unison_cents(i: usize, n: usize, spread: f32) -> f32 {
+    if n <= 1 {
+        0.0
+    } else {
+        // Evenly spaced across [-spread/2, +spread/2].
+        (i as f32 / (n - 1) as f32 - 0.5) * spread
+    }
 }
 
 fn white(rng: &mut u32) -> f32 {
@@ -827,6 +1024,7 @@ pub struct Synth {
     patch: Patch,
     pitch_lfo_phase: f32,
     filter_lfo_phase: f32,
+    pwm_lfo_phase: f32, // slow LFO driving pulse-width modulation
     last_freq: f32, // most recent note pitch — the glide origin for portamento
     rng: u32,
     monitor: Arc<VoiceMonitor>,
@@ -847,6 +1045,7 @@ impl Synth {
             patch: Patch::default(),
             pitch_lfo_phase: 0.0,
             filter_lfo_phase: 0.0,
+            pwm_lfo_phase: 0.0,
             last_freq: 220.0,
             rng: 0x1234_5678,
             monitor,
@@ -887,7 +1086,11 @@ impl Synth {
             voice.spread = pan;
             voice.gate_on(freq); // glide continues from the voice's current pitch
         } else {
-            let mut voice = Voice::new(id, freq);
+            // Seed the new voice's random phase/jitter from the shared rng.
+            self.rng ^= self.rng << 13;
+            self.rng ^= self.rng >> 17;
+            self.rng ^= self.rng << 5;
+            let mut voice = Voice::new(id, freq, self.rng);
             voice.spread = pan;
             // With portamento on, glide in from the previous note's pitch.
             voice.glide = if self.patch.glide > 0.0 { self.last_freq } else { freq };
@@ -927,15 +1130,17 @@ impl Synth {
 
         let pitch_lfo = (self.pitch_lfo_phase * TAU).sin();
         let filt_lfo = (self.filter_lfo_phase * TAU).sin();
+        let pwm_lfo = (self.pwm_lfo_phase * TAU).sin();
         self.pitch_lfo_phase = (self.pitch_lfo_phase + patch.pitch_lfo_rate / sr).fract();
         self.filter_lfo_phase = (self.filter_lfo_phase + patch.filter_lfo_rate / sr).fract();
+        self.pwm_lfo_phase = (self.pwm_lfo_phase + 0.7 / sr).fract(); // ~0.7 Hz
 
         let mut rng = self.rng;
         let mut l = 0.0;
         let mut r = 0.0;
         for voice in &mut self.voices {
             let noise = white(&mut rng);
-            let (vl, vr) = voice.render(&patch, pitch_lfo, filt_lfo, noise, sr);
+            let (vl, vr) = voice.render(&patch, pitch_lfo, filt_lfo, pwm_lfo, noise, sr);
             l += vl;
             r += vr;
         }
@@ -991,11 +1196,13 @@ mod tests {
     #[test]
     fn engine_stays_finite_and_in_range() {
         let mut s = Synth::new(48_000.0, Arc::new(VoiceMonitor::new()));
-        // A stress patch: square + noise, high resonance, filter + pitch LFOs.
+        // A stress patch exercising every extra: square + noise, high reso,
+        // LFOs, ring/fm/sync, sub, pwm, drift, drive, 24 dB HP, unison.
         let mut p = Patch::default();
         p.osc[0].wave = Wave::Square;
         p.osc[1].wave = Wave::Triangle;
         p.osc[1].fine = 7.0;
+        p.osc[0].pw = 0.2;
         p.noise = 0.4;
         p.resonance = 0.95;
         p.filter_env_amount = 1.0;
@@ -1003,6 +1210,18 @@ mod tests {
         p.filter_lfo_depth = 1.0;
         p.glide = 0.2;
         p.spread = 0.8;
+        p.sub = 0.8;
+        p.ring = 1.0;
+        p.fm = 1.0;
+        p.sync = true;
+        p.pwm = 1.0;
+        p.drift = 1.0;
+        p.drive = 1.0;
+        p.filter_mode = FilterMode::Hp;
+        p.filter_slope = 24;
+        p.filter_keytrack = 1.0;
+        p.unison = 4;
+        p.detune = 40.0;
         s.set_patch(p);
 
         s.note_on(60, 261.63, -0.8);

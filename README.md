@@ -236,19 +236,20 @@ edits live. In the editor, **arrow keys** move the cursor through the parameter
 grid and **`-` / `+`** (or `<` / `>`, `,` / `.`) change the selected value
 (hold to ramp).
 
-Signal path: `osc A + osc B + noise → resonant low-pass filter → amp`, in
-stereo (each oscillator can be panned).
+Signal path: `osc A + osc B (+ sub, ring) + noise → resonant multimode filter →
+drive → amp`, in stereo (each oscillator can be panned). The editor is four
+columns:
 
 | Group | Parameters |
 |-------|------------|
-| Osc A / Osc B | wave (sine / tri / square), pitch offset, fine detune (cents), level, pan |
-| Noise | level |
-| Amp env | attack, decay, sustain, release |
-| Filter | cutoff, resonance, envelope amount |
+| Osc A / Osc B | wave (sine / tri / square), pitch offset, fine detune (cents), **pulse width**, level, pan |
+| Mix / Mod | **sub** (octave-down square), **ring** (osc A×B), **fm** (A→B), **sync** (hard-sync B to A), **pwm** (pulse-width-mod depth), noise |
+| Amp env | attack, decay, sustain, release (exponential, analog-style) |
+| Filter | cutoff, resonance, envelope amount, **mode** (LP/HP/BP), **slope** (12/24 dB), **key-track** |
 | Filter env | attack, decay, sustain, release (its own ADSR, sweeps the cutoff) |
 | Pitch LFO | rate, depth (vibrato) — rate steps finely below 1 Hz |
 | Filter LFO | rate, depth (cutoff wobble) |
-| Global | glide (portamento time, 0 = off), spread (stereo width), master volume |
+| Global | glide, spread, **drift** (analog wander), **drive** (saturation), **unison** (1–4 stacked voices), **detune** (unison spread), master volume |
 
 **Spread** fans a chord's notes across the stereo field by their position in
 the chord — symmetric around center, re-centered for every chord, so it never
@@ -258,10 +259,19 @@ pans by its place in the chord), and layers on top of the per-oscillator pans.
 **Glide** is switchable portamento: notes slide in pitch from the previous note
 over the glide time — great on leads and arpeggios.
 
-Under the hood: PolyBLEP square to tame aliasing, a topology-preserving
-state-variable filter (per-voice, stereo) for the resonant low-pass, two
-free-running LFOs, and proper ADSR envelopes. The whole patch is a small `Copy`
-struct pushed to the audio thread on every edit.
+**Analog character.** Every voice starts at a **random oscillator phase**, and
+**drift** adds a slow per-voice pitch wander plus subtle cutoff/level jitter, so
+no two notes are bit-identical and stacked voices shimmer. Envelopes use
+**exponential** curves (natural attack/decay), and **drive** soft-saturates the
+output for grit. **Unison** stacks up to four detuned copies per note for
+supersaw thickness.
+
+Under the hood: PolyBLEP pulse oscillators (variable width) to tame aliasing, a
+topology-preserving state-variable filter (per-voice, stereo, LP/HP/BP, optional
+24 dB cascade) with key-tracking, a sub-oscillator, ring-mod / FM / hard-sync
+between the two oscillators, three free-running LFOs (pitch, filter, PWM), and
+exponential ADSR envelopes. The whole patch is a small `Copy` struct pushed to
+the audio thread on every edit.
 
 ### Presets & config slots
 

@@ -135,14 +135,20 @@ confirm the effect.
   (`patch Reese Bass`, case-insensitive). `autochord patches` lists them. The
   synth glides into the new patch over ~a beat rather than jumping.
 - any synth param by its `<engine>.`-prefixed key — for the subtractive engine:
-  `subtractive.osc1.wave sine|tri|sqr`, `subtractive.osc1.pitch`,
-  `subtractive.osc1.fine`, `subtractive.osc1.level`, `subtractive.osc1.pan`,
-  `subtractive.osc2.*`, `subtractive.noise`,
-  `subtractive.amp.attack|decay|sustain|release`,
-  `subtractive.filter.cutoff|reso|env`,
-  `subtractive.filterenv.attack|decay|sustain|release`,
-  `subtractive.pitchlfo.rate|depth`, `subtractive.filterlfo.rate|depth`,
-  `subtractive.glide`, `subtractive.spread`, `subtractive.master`
+  - osc (1 & 2): `subtractive.osc1.wave sine|tri|sqr`, `subtractive.osc1.pitch`,
+    `subtractive.osc1.fine`, `subtractive.osc1.pw` (pulse width 0.02–0.98),
+    `subtractive.osc1.level`, `subtractive.osc1.pan`, `subtractive.osc2.*`
+  - mix/mod: `subtractive.sub`, `subtractive.ring`, `subtractive.fm`,
+    `subtractive.sync on|off`, `subtractive.pwm`, `subtractive.noise`
+  - amp env: `subtractive.amp.attack|decay|sustain|release`
+  - filter: `subtractive.filter.cutoff|reso|env`,
+    `subtractive.filter.mode lp|hp|bp`, `subtractive.filter.slope 12|24`,
+    `subtractive.filter.keytrack`
+  - filter env: `subtractive.filterenv.attack|decay|sustain|release`
+  - LFOs: `subtractive.pitchlfo.rate|depth`, `subtractive.filterlfo.rate|depth`
+  - global: `subtractive.glide`, `subtractive.spread`, `subtractive.drift`
+    (analog wander), `subtractive.drive` (saturation), `subtractive.unison 1-4`,
+    `subtractive.detune` (cents), `subtractive.master`
 
 **Loops** are baked note-tapes, layered (overdub), phase-locked to the
 transport, and each slot plays on its own voice channel so they layer without
