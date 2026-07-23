@@ -181,12 +181,17 @@ locked to the arp and loops, across instances).
 - **Space** arms **tap-record**: hit the `z`–`m` pads in time and they land
   **quantized** onto the selected track's grid.
 
+**Kits.** **Home** / **End** page through **8 synthesis voicings** — `808 · 909
+· acoustic · lofi · chip · electro · deep · tape` — that reskin the whole kit
+(tuning, decay, drive, bit-crush, brightness, square vs sine bodies) without
+touching your patterns. The current kit shows in the drum header.
+
 The playhead lights each track's current column as it sweeps (respecting that
 track's divide/speed). The whole kit keeps grooving while you're on other tabs.
 Everything is exposed to the text interface — `drumN.inst`, `drumN.steps`
 (a 16-char `x`/`.` pattern), `drumN.release|pitch|level|pan|solo|mute|div|speed`,
-`drums.track`, `drums.on`, `drums.tap`, `drums.hit <inst>` — so agents can
-program beats too.
+`drums.track`, `drums.on`, `drums.tap`, `drums.hit <inst>`, `drums.kit
+<index-or-name>` — so agents can program beats too.
 
 ## Text control interface (for agents & scripts)
 

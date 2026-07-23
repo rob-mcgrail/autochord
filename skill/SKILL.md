@@ -62,6 +62,8 @@ loop4 empty 0bars 0layers
 drums.track 1
 drums.on on
 drums.tap off
+drums.kit 0
+drums.kit.name 808
 drum1.inst kick
 drum1.steps x...x...x...x...
 drum2.inst snare
@@ -165,6 +167,8 @@ maracas conga crash`.
 
 - `drums.track <1-8>` — selected track. `drums.on on|off` — sequencer enable.
   `drums.tap on|off` — tap-record arm. `drums.hit <inst>` — trigger a drum once.
+- `drums.kit <index-or-name>` — synthesis voicing (0-7), reskins the whole kit
+  without changing patterns: `808 909 acoustic lofi chip electro deep tape`.
 - `drumN.inst <inst>` — track N's instrument (N = 1..8).
 - `drumN.steps <16 chars>` — track N's pattern; `x`/`1`/`#`/`*` = hit, anything
   else (e.g. `.`) = rest. e.g. `drum1.steps x...x...x...x...` (four-on-the-floor).

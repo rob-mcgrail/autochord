@@ -24,6 +24,8 @@ pub enum SynthEvent {
     /// shaped by the track's `pitch` (freq mult), `release` (decay mult),
     /// `level`, and `pan`.
     DrumHit { inst: u8, pitch: f32, release: f32, level: f32, pan: f32 },
+    /// Select the drum kit (synthesis voicing) for subsequent hits.
+    SetDrumKit(u8),
 }
 
 /// Details about the running output stream, shown in the UI.
@@ -91,6 +93,7 @@ where
                     SynthEvent::DrumHit { inst, pitch, release, level, pan } => {
                         synth.drum_hit(inst, pitch, release, level, pan)
                     }
+                    SynthEvent::SetDrumKit(idx) => synth.set_drum_kit(idx as usize),
                 }
             }
 

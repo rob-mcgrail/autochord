@@ -882,11 +882,74 @@ fn white(rng: &mut u32) -> f32 {
 // ===========================================================================
 
 /// Max lifetime (seconds) per drum instrument, after which the voice is reaped
-/// (scaled by the hit's release). Order matches `app::DrumInst`.
+/// (scaled by the hit's release × the kit's decay). Order matches `app::DrumInst`.
 const DRUM_LIFE: [f32; 13] = [
     0.6, 0.4, 0.12, 0.5, 0.5, 0.6, 0.9, // kick snare hihat openhat cowbell tom ride
     0.4, 0.08, 0.12, 0.08, 0.5, 1.4, // clap rim clave maracas conga crash
 ];
+
+/// A drum "kit": synthesis modifiers layered over the base 808 voices so the
+/// same patterns can wear different sonic characters. Paged with Home/End.
+#[derive(Clone, Copy)]
+struct DrumKit {
+    pitch: f32,  // global tune multiplier
+    decay: f32,  // global decay / lifetime multiplier
+    drive: f32,  // output soft-saturation (0..1)
+    crush: f32,  // sample-rate / bit reduction (0..1, lo-fi)
+    bright: f32, // noise-cutoff multiplier (>1 brighter, <1 darker)
+    square: bool, // tonal bodies use a square wave (chip/electro)
+}
+
+impl Default for DrumKit {
+    fn default() -> Self {
+        DrumKit { pitch: 1.0, decay: 1.0, drive: 0.0, crush: 0.0, bright: 1.0, square: false }
+    }
+}
+
+/// Number of drum kits (synthesis voicings).
+pub const DRUM_KIT_COUNT: usize = 8;
+
+/// The kit table — `(name, modifiers)`, in Home/End paging order. Index 0 is
+/// the plain 808.
+fn drum_kits() -> [(&'static str, DrumKit); DRUM_KIT_COUNT] {
+    let k = |pitch, decay, drive, crush, bright, square| DrumKit {
+        pitch,
+        decay,
+        drive,
+        crush,
+        bright,
+        square,
+    };
+    [
+        ("808", k(1.0, 1.0, 0.0, 0.0, 1.0, false)),
+        ("909", k(1.0, 0.82, 0.3, 0.0, 1.4, false)),
+        ("acoustic", k(1.0, 1.35, 0.0, 0.0, 0.85, false)),
+        ("lofi", k(0.98, 0.9, 0.1, 0.6, 0.7, false)),
+        ("chip", k(1.0, 0.7, 0.0, 0.85, 1.0, true)),
+        ("electro", k(0.9, 1.1, 0.55, 0.15, 1.25, true)),
+        ("deep", k(0.8, 1.4, 0.15, 0.0, 0.8, false)),
+        ("tape", k(1.0, 1.05, 0.3, 0.25, 0.85, false)),
+    ]
+}
+
+/// A kit's display name.
+pub fn drum_kit_name(idx: usize) -> &'static str {
+    drum_kits()[idx % DRUM_KIT_COUNT].0
+}
+
+/// Parse a kit name to its index.
+pub fn drum_kit_index(name: &str) -> Option<usize> {
+    drum_kits().iter().position(|(n, _)| *n == name)
+}
+
+/// Tonal body: sine, or a square when the kit calls for it.
+fn drum_body(square: bool, ph: f32, dt: f32) -> f32 {
+    if square {
+        Wave::Square.sample(ph, dt, 0.5)
+    } else {
+        (ph * TAU).sin()
+    }
+}
 
 #[derive(Clone, Copy)]
 struct DrumVoice {
@@ -900,10 +963,14 @@ struct DrumVoice {
     release: f32, // decay multiplier (per-track release)
     level: f32,   // amplitude
     pan: f32,     // -1 (L) .. +1 (R)
+    kit: DrumKit, // synthesis voicing captured at trigger time
+    crush_hold: f32,
+    crush_ctr: u32,
 }
 
 impl DrumVoice {
-    fn new(inst: u8, rng: u32, pitch: f32, release: f32, level: f32, pan: f32) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn new(inst: u8, rng: u32, pitch: f32, release: f32, level: f32, pan: f32, kit: DrumKit) -> Self {
         Self {
             inst,
             age: 0.0,
@@ -915,44 +982,52 @@ impl DrumVoice {
             release,
             level,
             pan,
+            kit,
+            crush_hold: 0.0,
+            crush_ctr: 0,
         }
     }
 
     fn active(&self) -> bool {
-        self.age < DRUM_LIFE[(self.inst as usize).min(DRUM_LIFE.len() - 1)] * self.release
+        let life = DRUM_LIFE[(self.inst as usize).min(DRUM_LIFE.len() - 1)];
+        self.age < life * self.release * self.kit.decay
     }
 
-    /// One stereo sample `(l, r)`; advances the voice by one frame. `pitch`
-    /// multiplies tonal frequencies (and brightens noise), `release` stretches
-    /// the decays.
+    /// One stereo sample `(l, r)`; advances the voice by one frame. Per-hit
+    /// `pitch`/`release` and the kit's modifiers shape the base 808 voice.
     fn render(&mut self, sr: f32) -> (f32, f32) {
         let a = self.age;
-        let p = self.pitch;
-        let r = self.release;
+        let p = self.pitch * self.kit.pitch; // effective tune
+        let r = self.release * self.kit.decay; // effective decay
+        let bright = self.kit.bright;
+        let square = self.kit.square;
         let sq = |ph: f32| if ph < 0.5 { 1.0 } else { -1.0 };
-        // High-passed noise with a pitch-brightened cutoff, reused by several.
+        // High-passed noise with a pitch/kit-brightened cutoff.
         let hp = |lp: &mut f32, rng: &mut u32, coeff: f32| {
             let n = white(rng);
-            *lp += (coeff * p).clamp(0.05, 0.98) * (n - *lp);
+            *lp += (coeff * p * bright).clamp(0.05, 0.98) * (n - *lp);
             n - *lp
         };
-        let s = match self.inst {
+        let mut s = match self.inst {
             0 => {
                 // Kick: pitch drops 130→50 Hz, exp amp decay.
                 let f = (50.0 + 80.0 * (-a / (0.03 * r)).exp()) * p;
-                self.phase = (self.phase + f / sr).fract();
-                (self.phase * TAU).sin() * (-a / (0.25 * r)).exp()
+                let dt = f / sr;
+                self.phase = (self.phase + dt).fract();
+                drum_body(square, self.phase, dt) * (-a / (0.25 * r)).exp()
             }
             5 => {
                 // Tom: like the kick, higher and a touch longer.
                 let f = (90.0 + 100.0 * (-a / (0.06 * r)).exp()) * p;
-                self.phase = (self.phase + f / sr).fract();
-                (self.phase * TAU).sin() * (-a / (0.3 * r)).exp()
+                let dt = f / sr;
+                self.phase = (self.phase + dt).fract();
+                drum_body(square, self.phase, dt) * (-a / (0.3 * r)).exp()
             }
             1 => {
                 // Snare: a 180 Hz body plus high-passed noise.
-                self.phase = (self.phase + 180.0 * p / sr).fract();
-                let tone = (self.phase * TAU).sin() * (-a / (0.08 * r)).exp() * 0.5;
+                let dt = 180.0 * p / sr;
+                self.phase = (self.phase + dt).fract();
+                let tone = drum_body(square, self.phase, dt) * (-a / (0.08 * r)).exp() * 0.5;
                 hp(&mut self.lp, &mut self.rng, 0.6) * (-a / (0.2 * r)).exp() * 0.7 + tone
             }
             2 => {
@@ -981,13 +1056,15 @@ impl DrumVoice {
             }
             8 => {
                 // Rimshot: a very short high tone click.
-                self.phase = (self.phase + 1700.0 * p / sr).fract();
-                (self.phase * TAU).sin() * (-a / (0.02 * r)).exp() * 0.7
+                let dt = 1700.0 * p / sr;
+                self.phase = (self.phase + dt).fract();
+                drum_body(square, self.phase, dt) * (-a / (0.02 * r)).exp() * 0.7
             }
             9 => {
                 // Clave: a bright woodblock tone.
-                self.phase = (self.phase + 2500.0 * p / sr).fract();
-                (self.phase * TAU).sin() * (-a / (0.03 * r)).exp() * 0.6
+                let dt = 2500.0 * p / sr;
+                self.phase = (self.phase + dt).fract();
+                drum_body(square, self.phase, dt) * (-a / (0.03 * r)).exp() * 0.6
             }
             10 => {
                 // Maracas: a very short bright noise shake.
@@ -996,8 +1073,9 @@ impl DrumVoice {
             11 => {
                 // Conga: a tight pitched drum, higher than the tom.
                 let f = (220.0 + 60.0 * (-a / (0.05 * r)).exp()) * p;
-                self.phase = (self.phase + f / sr).fract();
-                (self.phase * TAU).sin() * (-a / (0.35 * r)).exp()
+                let dt = f / sr;
+                self.phase = (self.phase + dt).fract();
+                drum_body(square, self.phase, dt) * (-a / (0.35 * r)).exp()
             }
             12 => {
                 // Crash: long, bright, shimmering cymbal.
@@ -1008,6 +1086,21 @@ impl DrumVoice {
             _ => 0.0,
         };
         self.age += 1.0 / sr;
+
+        // Kit drive (soft saturation) then crush (sample-rate + bit reduction).
+        if self.kit.drive > 0.0 {
+            s = (s * (1.0 + self.kit.drive * 5.0)).tanh();
+        }
+        if self.kit.crush > 0.0 {
+            if self.crush_ctr == 0 {
+                let levels = 2f32.powf(8.0 - self.kit.crush * 6.0);
+                self.crush_hold = (s * levels).round() / levels;
+                self.crush_ctr = 1 + (self.kit.crush * 12.0) as u32;
+            }
+            self.crush_ctr = self.crush_ctr.saturating_sub(1);
+            s = self.crush_hold;
+        }
+
         let (lg, rg) = pan_gains(self.pan);
         let out = s * self.level;
         (out * lg, out * rg)
@@ -1035,6 +1128,8 @@ pub struct Synth {
     click_freq: f32,
     /// Sounding 808-style drum one-shots.
     drum_voices: Vec<DrumVoice>,
+    /// Selected drum kit (synthesis voicing) applied to new drum hits.
+    drum_kit: DrumKit,
 }
 
 impl Synth {
@@ -1053,18 +1148,25 @@ impl Synth {
             click_phase: 0.0,
             click_freq: 1000.0,
             drum_voices: Vec::with_capacity(16),
+            drum_kit: DrumKit::default(),
         }
     }
 
     /// Trigger an 808-style drum one-shot (`inst` indexes the kit), tuned and
-    /// shaped by the per-track `pitch`/`release`/`level`/`pan`.
+    /// shaped by the per-track `pitch`/`release`/`level`/`pan` and the selected
+    /// kit's voicing.
     pub fn drum_hit(&mut self, inst: u8, pitch: f32, release: f32, level: f32, pan: f32) {
         // Advance the shared rng so each hit's noise differs.
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 17;
         self.rng ^= self.rng << 5;
         self.drum_voices
-            .push(DrumVoice::new(inst, self.rng, pitch, release, level, pan));
+            .push(DrumVoice::new(inst, self.rng, pitch, release, level, pan, self.drum_kit));
+    }
+
+    /// Select the drum kit (synthesis voicing) for subsequent hits.
+    pub fn set_drum_kit(&mut self, idx: usize) {
+        self.drum_kit = drum_kits()[idx % DRUM_KIT_COUNT].1;
     }
 
     pub fn set_patch(&mut self, patch: Patch) {
@@ -1237,12 +1339,17 @@ mod tests {
     #[test]
     fn drums_stay_finite_and_in_range() {
         let mut s = Synth::new(48_000.0, Arc::new(VoiceMonitor::new()));
-        // Every instrument, with extreme tune/release/level/pan.
-        for inst in 0..13 {
-            s.drum_hit(inst, 2.0, 4.0, 1.5, -1.0);
-            s.drum_hit(inst, 0.5, 0.25, 1.5, 1.0);
+        // Every instrument across every kit, with extreme tune/release/level/pan
+        // (exercises drive, crush, square bodies, and reaping).
+        for kit in 0..DRUM_KIT_COUNT {
+            s.set_drum_kit(kit);
+            for inst in 0..13 {
+                s.drum_hit(inst, 2.0, 4.0, 1.5, -1.0);
+                s.drum_hit(inst, 0.5, 0.25, 1.5, 1.0);
+            }
+            run(&mut s, 48_000 * 3);
         }
-        run(&mut s, 48_000 * 6); // ~6s: even the longest (crash × release 4) reaps
+        run(&mut s, 48_000 * 6); // let the longest tails reap
         assert!(s.drum_voices.is_empty(), "drum voices should be reaped");
     }
 }

@@ -975,6 +975,8 @@ pub struct App {
     drums_on: bool,
     /// Tap-record armed (Space): drum triggers write quantized into the grid.
     drum_tap: bool,
+    /// Selected drum kit (synthesis voicing); Home/End page it.
+    drum_kit: usize,
     /// Shared clock: tempo + beat grid, synced across instances.
     transport: Transport,
     /// Arpeggiator runtime: pattern position, the note currently sounding, and
@@ -1068,6 +1070,7 @@ impl App {
             drum_col: 0,
             drums_on: true,
             drum_tap: false,
+            drum_kit: 0,
             transport,
             arp_pos: 0,
             arp_sounding: None,
@@ -1117,13 +1120,23 @@ impl App {
             return;
         }
 
-        // PgUp / PgDn cycle the preset bank (both views); wraps around.
+        // PgUp / PgDn cycle the preset bank (all views); wraps around.
         if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
             if key.kind == KeyEventKind::Press {
                 let n = crate::synth::PRESET_COUNT;
                 // PgUp = previous, PgDn = next.
                 let step = if key.code == KeyCode::PageUp { n - 1 } else { 1 };
                 self.load_preset((self.patch_index + step) % n);
+            }
+            return;
+        }
+
+        // Home / End page the drum kit (synthesis voicing); wraps around.
+        if matches!(key.code, KeyCode::Home | KeyCode::End) {
+            if key.kind == KeyEventKind::Press {
+                let n = crate::synth::DRUM_KIT_COUNT;
+                let step = if key.code == KeyCode::Home { n - 1 } else { 1 };
+                self.set_drum_kit((self.drum_kit + step) % n);
             }
             return;
         }
@@ -1429,6 +1442,12 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Select the drum kit (synthesis voicing) and tell the audio thread.
+    fn set_drum_kit(&mut self, idx: usize) {
+        self.drum_kit = idx % crate::synth::DRUM_KIT_COUNT;
+        let _ = self.tx.send(SynthEvent::SetDrumKit(self.drum_kit as u8));
     }
 
     /// The DrumHit params (inst, pitch-mul, release, level, pan) for a track.
@@ -2604,6 +2623,8 @@ impl App {
         let _ = writeln!(s, "drums.track {}", self.drum_sel + 1);
         let _ = writeln!(s, "drums.on {}", onoff(self.drums_on));
         let _ = writeln!(s, "drums.tap {}", onoff(self.drum_tap));
+        let _ = writeln!(s, "drums.kit {}", self.drum_kit);
+        let _ = writeln!(s, "drums.kit.name {}", crate::synth::drum_kit_name(self.drum_kit));
         for (i, tr) in self.drum_tracks.iter().enumerate() {
             let n = i + 1;
             let pat: String = tr.steps.iter().map(|&on| if on { 'x' } else { '.' }).collect();
@@ -2734,6 +2755,16 @@ impl App {
             }
             "drums.on" => self.drums_on = arg == "on",
             "drums.tap" => self.drum_tap = arg == "on",
+            "drums.kit" => {
+                let idx = arg
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|&i| i < crate::synth::DRUM_KIT_COUNT)
+                    .or_else(|| crate::synth::drum_kit_index(arg));
+                if let Some(i) = idx {
+                    self.set_drum_kit(i);
+                }
+            }
             "drums.hit" => {
                 if let Some(inst) = DrumInst::from_label(arg) {
                     // Audition with the first matching track's tuning, if any.
@@ -3110,9 +3141,15 @@ fn render_drums(app: &App, frame: &mut Frame, area: Rect) {
             Span::styled("  1-8 ", Style::default().fg(Color::DarkGray)),
             Span::styled("track ", Style::default().fg(Color::Yellow)),
             Span::styled(
-                "· ←→ ctrl +/- adjust · q-i/a-k steps · z-m play   ",
+                "· ←→ ctrl +/- adjust · q-i/a-k steps · z-m play · ",
                 Style::default().fg(Color::DarkGray),
             ),
+            Span::styled("kit ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} ", crate::synth::drum_kit_name(app.drum_kit)),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("(Home/End)  ", Style::default().fg(Color::DarkGray)),
             tap,
         ])),
         rows[0],
@@ -4638,6 +4675,27 @@ mod tests {
         assert!(s.contains("drum2.speed 2.00x"));
         assert!(s.contains("drums.track 3"));
         assert!(s.contains("drums.on off"));
+    }
+
+    #[test]
+    fn drum_kit_pages_and_round_trips() {
+        let mut a = app();
+        assert_eq!(a.drum_kit, 0);
+        // End pages forward, Home back (wrapping) — global, any view.
+        a.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(a.drum_kit, 1);
+        a.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(a.drum_kit, 0);
+        a.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)); // wrap to last
+        assert_eq!(a.drum_kit, crate::synth::DRUM_KIT_COUNT - 1);
+
+        // Text interface: select by index or name.
+        a.apply_command("drums.kit 3");
+        assert_eq!(a.drum_kit, 3);
+        a.apply_command("drums.kit chip");
+        assert_eq!(a.drum_kit, crate::synth::drum_kit_index("chip").unwrap());
+        let s = a.state_text();
+        assert!(s.contains("drums.kit.name chip"));
     }
 
     #[test]
